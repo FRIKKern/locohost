@@ -11,6 +11,7 @@
 #import "Rules.h"
 #import "Review.h"
 #import "Intel.h"
+#import "Where.h"
 
 static NSString *const kReviewMinKey = @"locohost.reviewMinutes";   // default 60, 0 off
 static NSString *const kModelKey     = @"locohost.model";           // default auto: Haiku, then Luna
@@ -162,6 +163,13 @@ static NSArray<NSDictionary *> *Plan(NSArray<LHHost *> *hosts, LHReview *r, LHMo
         }
         [plan addObject:@{@"host": h, @"stop": @(stop), @"why": why}];
     }
+    return plan;
+}
+
+/// The plan by host key, as the menu uses it. Not static, so a snapshot harness can build the same card.
+NSDictionary *LHMenuPlan(NSArray<LHHost *> *hosts, LHReview *r) {
+    NSMutableDictionary *plan = [NSMutableDictionary new];
+    for (NSDictionary *p in Plan(hosts, r, Mode(), NO)) plan[((LHHost *)p[@"host"]).key] = p;
     return plan;
 }
 
@@ -419,6 +427,7 @@ static int Usage(void) {
         "  ready <port>          wait until the port accepts connections; exit 0 ready, 1 timed out\n"
         "  free [port]           the first free port at or above port (default 3000)\n"
         "  explain <port>        what it is, how it runs, why it is there and what it wastes, with every fact found\n"
+        "  where <port>          the cmux tab, tmux pane, terminal tab or app it runs in (--go brings it forward)\n"
         "  waste                 what each server burned since it was last used, and duplicates\n"
         "  review                ask the model which localhosts are in use; in Eager mode the judge looks again\n"
         "  summary               what is going on, in the model's words, and what the mode would do\n"
@@ -543,12 +552,12 @@ static int RunCLI(int argc, const char **argv) {
         [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:[NSString stringWithFormat:@"http://localhost:%@", arg1]]];
         return 0;
     }
-    if (![@[@"list", @"who", @"explain", @"waste", @"review", @"summary", @"auto", @"idle", @"close", @"close-idle", @"keep"] containsObject:cmd]) return Usage();
+    if (![@[@"list", @"who", @"explain", @"where", @"waste", @"review", @"summary", @"auto", @"idle", @"close", @"close-idle", @"keep"] containsObject:cmd]) return Usage();
 
     LHScanner *s = [LHScanner new];
     s.idleSeconds = IdleMinutes() * 60;
     [s sample]; [NSThread sleepForTimeInterval:1.0]; [s sample];   // two samples for CPU%
-    if (PrefBool(kProbeKey, YES) && ![cmd hasPrefix:@"close"] && ![cmd isEqualToString:@"auto"]) {
+    if (PrefBool(kProbeKey, YES) && ![cmd hasPrefix:@"close"] && ![@[@"auto", @"where"] containsObject:cmd]) {
         __block BOOL done = NO;
         [s probeHosts:^{ done = YES; }];
         NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:4];
@@ -613,7 +622,24 @@ static int RunCLI(int argc, const char **argv) {
         if ([h.kind isEqualToString:@"dev"]) printf("  why        %s\n", (v.why.length ? v.why : SessionWords(intel[@"session"])).UTF8String);
         printf("  waste      %s\n", WasteWords(h).UTF8String);
         if (h.duplicates.count) printf("  duplicate  same folder and branch as :%s\n", [[h.duplicates valueForKey:@"stringValue"] componentsJoinedByString:@", :"].UTF8String);
+        NSDictionary *where = LHWhere(h, YES);
+        if (where) printf("  where      %s\n", [where[@"label"] UTF8String]);
         if (h.isProtected) printf("  protected  Close Idle never stops it\n");
+        return 0;
+    }
+
+    if ([cmd isEqualToString:@"where"]) {
+        if (!arg1) return Usage();
+        LHHost *h = FindHost(s.hosts, arg1);
+        if (!h) { fprintf(stderr, "no localhost on %s\n", arg1.UTF8String); return 1; }
+        NSDictionary *w = LHWhere(h, YES);
+        if (json) { PrintJSON(w ?: @{}); return w ? 0 : 1; }
+        if (!w) { printf(":%ld: no terminal or app found\n", (long)h.port); return 1; }
+        printf(":%ld  %s\n", (long)h.port, [w[@"label"] UTF8String]);
+        if ([args containsObject:@"--go"]) {
+            NSString *e = nil;
+            if (!LHGoTo(w, &e) && e) { fprintf(stderr, "%s\n", e.UTF8String); return 1; }
+        }
         return 0;
     }
 
@@ -625,7 +651,7 @@ static int RunCLI(int argc, const char **argv) {
         LHVerdict *v = review.verdicts[h.key];
         if (json) {
             NSMutableDictionary *j = [HostJSON(h, review) mutableCopy];
-            j[@"intel"] = intel; j[@"waste"] = LHWasteFacts(h);
+            j[@"intel"] = intel; j[@"waste"] = LHWasteFacts(h); j[@"where"] = LHWhere(h, YES) ?: NSNull.null;
             PrintJSON(j); return 0;
         }
         printf(":%ld  %s  %s  (pid %d, %s)\n\n", (long)h.port, h.framework.UTF8String, h.project.UTF8String, h.pid, h.kind.UTF8String);
@@ -813,6 +839,7 @@ static int RunCLI(int argc, const char **argv) {
 @property BOOL learned;                                                      // the servers running at launch are known
 @property (strong) dispatch_source_t pressure;
 @property (strong) NSDictionary<NSString *, NSDictionary *> *plan;   // by host key, built when the menu opens
+@property (copy) NSString *prefix;                                    // the start every dev server's name shares, left out of rows
 @end
 
 @implementation LocoHost
@@ -869,6 +896,7 @@ static int RunCLI(int argc, const char **argv) {
     self.scanner.idleSeconds = IdleMinutes() * 60;
     [self.scanner sample];
     for (LHHost *h in self.scanner.hosts) LHIntel(h, NO);   // reads project, git and sessions in the background, five-minute cache
+    if (self.ticks % 6 == 0) LHWhereRefresh(self.scanner.hosts);   // which cmux tab, tmux pane or app each one runs in
     if (self.ticks++ % 6 == 0 && PrefBool(kProbeKey, YES)) [self.scanner probeHosts:nil];   // every 30 s, each host at most every 5 min
     [self watchEvents];
     NSInteger every = PrefInt(kReviewMinKey, 60);
@@ -940,71 +968,222 @@ static NSMenuItem *Item(NSMenu *m, NSString *t, SEL a, id target, BOOL on) {
 static NSMenuItem *Header(NSMenu *m, NSString *t) { NSMenuItem *i = Item(m, t, NULL, nil, NO); i.enabled = NO; return i; }
 static NSMenuItem *Sub(NSMenu *m, NSString *t, NSMenu *sub) { NSMenuItem *i = Item(m, t, NULL, nil, NO); i.submenu = sub; return i; }
 
+/// One calm line per host: a colored dot, the port, what it is, then memory and uptime in aligned columns.
+/// Everything else lives in the row's submenu.
 - (NSAttributedString *)rowTitle:(LHHost *)h {
     NSColor *dot = h.state == LHActive ? NSColor.systemGreenColor : [StateMark(h, self.review) isEqualToString:@"◇"] ? NSColor.systemOrangeColor
                  : h.state == LHRecent ? NSColor.systemYellowColor : NSColor.tertiaryLabelColor;
-    NSFont *f = [NSFont menuFontOfSize:0], *mono = [NSFont monospacedDigitSystemFontOfSize:f.pointSize weight:NSFontWeightSemibold];
-    NSMutableAttributedString *s = [NSMutableAttributedString new];
-    [s appendAttributedString:[[NSAttributedString alloc] initWithString:[StateMark(h, self.review) stringByAppendingString:@" "] attributes:@{NSForegroundColorAttributeName: dot, NSFontAttributeName: f}]];
-    [s appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@":%-5ld ", (long)h.port] attributes:@{NSFontAttributeName: mono}]];
-    [s appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%@  %@", h.framework, Cut(h.project, 44)] attributes:@{NSFontAttributeName: f}]];
-    if (h.branch) [s appendAttributedString:[[NSAttributedString alloc] initWithString:[@"  " stringByAppendingString:Cut(h.branch, 28)] attributes:@{NSForegroundColorAttributeName: NSColor.secondaryLabelColor, NSFontAttributeName: f}]];
-    NSString *meta = [NSString stringWithFormat:@"    up %@ · %@ · %@ · %@", LHDuration(-h.started.timeIntervalSinceNow), Pct(h.cpuPercent), LHFormatBytes(h.memory), StateWords(h)];
-    [s appendAttributedString:[[NSAttributedString alloc] initWithString:meta attributes:@{NSForegroundColorAttributeName: NSColor.secondaryLabelColor, NSFontAttributeName: f}]];
-    return s;
+    NSFont *f = [NSFont menuFontOfSize:0], *mono = [NSFont monospacedDigitSystemFontOfSize:f.pointSize weight:NSFontWeightRegular];
+    NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new];
+    ps.tabStops = @[[[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentLeft location:18 options:@{}],
+                    [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentLeft location:74 options:@{}],
+                    [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:400 options:@{}],
+                    [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:450 options:@{}]];
+    NSDictionary *base = @{NSFontAttributeName: f, NSParagraphStyleAttributeName: ps};
+    NSMutableDictionary *dim = [base mutableCopy]; dim[NSForegroundColorAttributeName] = NSColor.secondaryLabelColor; dim[NSFontAttributeName] = mono;
+    NSMutableDictionary *dotA = [base mutableCopy]; dotA[NSForegroundColorAttributeName] = dot;
+    NSMutableDictionary *portA = [base mutableCopy]; portA[NSFontAttributeName] = mono;
+    NSString *name = [h.kind isEqualToString:@"dev"] ? [NSString stringWithFormat:@"%@  %@", h.framework, h.worktree ?: h.project] : h.framework;
+    NSString *up = [LHDuration(-h.started.timeIntervalSinceNow) componentsSeparatedByString:@" "].firstObject;
+    NSMutableAttributedString *t = [NSMutableAttributedString new];
+    [t appendAttributedString:[[NSAttributedString alloc] initWithString:@"●" attributes:dotA]];
+    [t appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"\t:%ld", (long)h.port] attributes:portA]];
+    [t appendAttributedString:[[NSAttributedString alloc] initWithString:[@"\t" stringByAppendingString:Cut(name, 38)] attributes:base]];
+    [t appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"\t%@\t%@", LHFormatBytes(h.memory), up] attributes:dim]];
+    return t;
+}
+
+/// A menu line with a gray tail, such as "Review Now   3m ago · Haiku".
+static NSAttributedString *Titled(NSString *title, NSString *tail) {
+    NSFont *f = [NSFont menuFontOfSize:0];
+    NSMutableAttributedString *t = [[NSMutableAttributedString alloc] initWithString:title attributes:@{NSFontAttributeName: f}];
+    if (tail.length) [t appendAttributedString:[[NSAttributedString alloc] initWithString:title.length ? [@"   " stringByAppendingString:tail] : tail
+                                                                              attributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: NSColor.secondaryLabelColor}]];
+    return t;
+}
+
+/// The menu's newer parts: subtitles, badges, section headers and the inline palette need macOS 14.4.
+static BOOL ModernMenu(void) { if (@available(macOS 14.4, *)) return YES; return NO; }
+
+static NSString *ShortName(LHHost *h) { return [h.kind isEqualToString:@"dev"] ? (h.worktree ?: h.project) : h.framework; }
+
+/// The top of the menu: memory in large type, one line of counts, and the state bar.
+static NSView *MenuHeader(NSArray<LHHost *> *hosts, LHReview *r, NSString *line, double cpu) {
+    CGFloat w = 330;
+    NSView *v = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, w, 62)];
+    uint64_t mem = 0; for (LHHost *h in hosts) mem += h.memory;
+    NSTextField *n = [NSTextField labelWithString:LHFormatBytes(mem)];
+    n.font = [NSFont monospacedDigitSystemFontOfSize:22 weight:NSFontWeightSemibold]; n.frame = NSMakeRect(14, 24, 200, 28); [v addSubview:n];
+    NSTextField *c = [NSTextField labelWithString:[NSString stringWithFormat:@"%@ CPU", Pct(cpu)]];
+    c.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightMedium]; c.textColor = NSColor.secondaryLabelColor;
+    c.alignment = NSTextAlignmentRight; c.frame = NSMakeRect(w - 134, 30, 120, 16); [v addSubview:c];
+    NSTextField *l = [NSTextField labelWithString:line];
+    l.font = [NSFont systemFontOfSize:12]; l.textColor = NSColor.secondaryLabelColor; l.lineBreakMode = NSLineBreakByTruncatingTail;
+    l.frame = NSMakeRect(14, 8, w - 28, 15); [v addSubview:l];
+    return v;
+}
+
+/// Wrapped, readable text of a fixed width and at most `lines` lines (0 for no limit), sized to fit.
+static NSTextField *Para(NSString *text, NSFont *font, NSColor *color, CGFloat width, NSInteger lines) {
+    NSTextField *t = [NSTextField wrappingLabelWithString:text ?: @""];
+    t.font = font; t.textColor = color; t.preferredMaxLayoutWidth = width;
+    t.maximumNumberOfLines = lines; t.cell.truncatesLastVisibleLine = YES;
+    CGFloat h = [t.cell cellSizeForBounds:NSMakeRect(0, 0, width, 4000)].height;
+    if (lines > 0) h = MIN(h, ceil(lines * (font.ascender - font.descender + font.leading) + 1));
+    [t.widthAnchor constraintEqualToConstant:width].active = YES; [t.heightAnchor constraintEqualToConstant:h].active = YES;
+    t.frame = NSMakeRect(0, 0, width, h);
+    return t;
+}
+static NSAttributedString *Rich(NSString *bold, NSColor *boldColor, NSString *rest, CGFloat size) {
+    NSMutableAttributedString *a = [[NSMutableAttributedString alloc] initWithString:bold attributes:@{
+        NSFontAttributeName: [NSFont systemFontOfSize:size weight:NSFontWeightSemibold], NSForegroundColorAttributeName: boldColor}];
+    if (rest.length) [a appendAttributedString:[[NSAttributedString alloc] initWithString:[@" " stringByAppendingString:rest] attributes:@{
+        NSFontAttributeName: [NSFont systemFontOfSize:size], NSForegroundColorAttributeName: NSColor.labelColor}]];
+    return a;
+}
+
+/// Text inside a menu at a readable width, in the normal text color rather than the gray of a disabled item.
+static NSMenuItem *TextItem(NSString *text, NSInteger lines) {
+    NSTextField *t = Para(text, [NSFont systemFontOfSize:12.5], NSColor.secondaryLabelColor, 302, lines);
+    NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 330, t.frame.size.height + 10)];
+    t.frame = NSMakeRect(14, 5, 302, t.frame.size.height); [box addSubview:t];
+    NSMenuItem *i = [NSMenuItem new]; i.view = box;
+    return i;
+}
+
+static NSString *Sentence(NSString *s) {
+    if (!s.length) return @"";
+    s = [[s substringToIndex:1].uppercaseString stringByAppendingString:[s substringFromIndex:1]];
+    return [s hasSuffix:@"."] ? s : [s stringByAppendingString:@"."];
+}
+
+static void Section(NSMenu *m, NSString *title) {
+    if (@available(macOS 14.0, *)) [m addItem:[NSMenuItem sectionHeaderWithTitle:title]];
+    else Header(m, title);
+}
+
+/// Why a host is still running, in plain words: a short colored head, then the reason and what happens next.
+- (NSArray *)statusFor:(LHHost *)h {
+    NSDictionary *p = self.plan[h.key];
+    if ([h.kind isEqualToString:@"service"]) return @[@"Shared service.", NSColor.secondaryLabelColor, @"No mode stops services such as databases; stop it yourself if you want it gone."];
+    if (!p) return @[@"Other listener.", NSColor.secondaryLabelColor, @"High-port listeners are listed only, and no mode stops them."];
+    NSString *why = p[@"why"];
+    if ([p[@"stop"] boolValue]) return @[@"Stops at the next review.", NSColor.systemOrangeColor, Sentence(Cut(why, 220))];
+    LHMode mode = Mode();
+    if (mode == LHModeIdle) return @[@"Staying on.", NSColor.systemGreenColor, @"Idle mode only reports. Close Idle or Stop are up to you."];
+    NSString *next = @"";
+    if ([why hasPrefix:@"used "] || [why isEqualToString:@"in use"])
+        next = [NSString stringWithFormat:@" %@ looks again after %@ of quiet.", ModeLabel(mode), LHDuration(IdleMinutes() * 60)];
+    else if ([why hasPrefix:@"started only"]) next = @" New servers get 30 minutes.";
+    else if ([why hasPrefix:@"its agent session"]) next = @" The agent may still need it.";
+    else if ([why hasPrefix:@"used after the last review"]) next = @" The next review looks again.";
+    else if ([why hasPrefix:@"not judged yet"]) { why = @"not judged yet"; next = @" The judge looks at it in the next review."; }
+    else if ([why hasPrefix:@"evidence: "]) why = [@"the judge found evidence: " stringByAppendingString:[why substringFromIndex:10]];
+    return @[@"Staying on.", NSColor.systemGreenColor, [Sentence(Cut(why, 200)) stringByAppendingString:next]];
+}
+
+/// Git in a few words: when it last changed, whether everything is in the default branch, and what is left.
+static NSString *GitState(NSDictionary *g) {
+    if (!g) return nil;
+    NSMutableArray *p = [NSMutableArray new];
+    if (g[@"last_commit_minutes_ago"]) [p addObject:[NSString stringWithFormat:@"last commit %@ ago", [LHDuration([g[@"last_commit_minutes_ago"] doubleValue] * 60) componentsSeparatedByString:@" "].firstObject]];
+    NSInteger out = [g[@"commits_not_in_default"] integerValue];
+    if (g[@"commits_not_in_default"]) [p addObject:out ? [NSString stringWithFormat:@"%@ not in %@", Plural(out, @"commit"), g[@"default_branch"] ?: @"main"]
+                                                       : [NSString stringWithFormat:@"all in %@", g[@"default_branch"] ?: @"main"]];
+    if ([g[@"dirty_files"] integerValue]) [p addObject:Plural([g[@"dirty_files"] integerValue], @"uncommitted file")];
+    if ([g[@"upstream"] isEqual:@"gone"]) [p addObject:@"remote branch deleted"];
+    return [p componentsJoinedByString:@" · "];
+}
+
+/// The readable card at the top of a host's submenu.
+- (NSMenuItem *)cardFor:(LHHost *)h {
+    CGFloat inner = 350;
+    LHVerdict *v = self.review.verdicts[h.key];
+    NSDictionary *intel = LHIntel(h, NO);
+    NSStackView *s = [NSStackView new];
+    s.orientation = NSUserInterfaceLayoutOrientationVertical; s.alignment = NSLayoutAttributeLeading; s.spacing = 8;
+    s.edgeInsets = NSEdgeInsetsMake(10, 16, 10, 16);
+
+    NSString *title = v.about.length ? v.about : WhatWords(h, v, intel) ?: [NSString stringWithFormat:@"%@ in %@", h.framework, h.project];
+    [s addArrangedSubview:Para(Sentence(title), [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold], NSColor.labelColor, inner, 2)];
+    NSArray *st = [self statusFor:h];
+    NSTextField *status = Para(@"", [NSFont systemFontOfSize:12.5], NSColor.labelColor, inner, 4);
+    status.attributedStringValue = Rich(st[0], st[1], st[2], 12.5);
+    [status.constraints.lastObject setConstant:[status.cell cellSizeForBounds:NSMakeRect(0, 0, inner, 4000)].height];
+    [s addArrangedSubview:status];
+
+    // Facts as label and value, in two columns.
+    NSMutableArray *rows = [NSMutableArray new];
+    void (^fact)(NSString *, NSString *) = ^(NSString *label, NSString *value) {
+        if (!value.length) return;
+        NSTextField *l = [NSTextField labelWithString:label]; l.font = [NSFont systemFontOfSize:11.5]; l.textColor = NSColor.tertiaryLabelColor;
+        NSTextField *x = [NSTextField labelWithString:value]; x.font = [NSFont systemFontOfSize:12]; x.textColor = NSColor.labelColor;
+        x.lineBreakMode = NSLineBreakByTruncatingTail; [x.widthAnchor constraintLessThanOrEqualToConstant:inner - 70].active = YES;
+        x.toolTip = value;
+        [rows addObject:@[l, x]];
+    };
+    NSDictionary *where = LHWhere(h, NO);
+    fact(@"Where", where[@"label"]);
+    fact(@"Up", LHDuration(-h.started.timeIntervalSinceNow));
+    fact(@"Started", h.launcher.length ? h.launcher : @"unknown");
+    fact(@"Uses", [NSString stringWithFormat:@"%@ · %@ CPU now%@", LHFormatBytes(h.memory), Pct(h.cpuPercent),
+                   h.clients.count ? [@" · " stringByAppendingString:[h.clients componentsJoinedByString:@", "]] : @""]);
+    fact(@"Project", [NSString stringWithFormat:@"%@%@", h.project, h.branch ? [@" · " stringByAppendingString:h.branch] : @""]);
+    if ([h.kind isEqualToString:@"dev"]) fact(@"Agent", intel ? SessionWords(intel[@"session"]) : @"looking…");
+    fact(@"Git", GitState(intel[@"git"]));
+    if (h.title.length) fact(@"Page", h.title);
+    if (rows.count) {
+        NSGridView *g = [NSGridView gridViewWithViews:rows];
+        g.rowSpacing = 4; g.columnSpacing = 10; [g columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
+        [s addArrangedSubview:g];
+    }
+    if (v.reason.length)
+        [s addArrangedSubview:Para([NSString stringWithFormat:@"%@ says %@: %@", LHModelLabel(self.review.model), [v.verdict stringByReplacingOccurrencesOfString:@"_" withString:@" "], v.reason],
+                                   [NSFont systemFontOfSize:11.5], NSColor.secondaryLabelColor, inner, 3)];
+    NSSize fit = s.fittingSize;
+    s.frame = NSMakeRect(0, 0, MAX(fit.width, inner + 32), fit.height);
+    NSMenuItem *i = [NSMenuItem new]; i.view = s;
+    return i;
 }
 
 - (NSMenuItem *)hostItem:(LHHost *)h {
+    NSString *name = ShortName(h);
+    if (self.prefix.length && [h.kind isEqualToString:@"dev"] && [name hasPrefix:self.prefix] && name.length > self.prefix.length) name = [name substringFromIndex:self.prefix.length];
     NSMenuItem *i = [[NSMenuItem alloc] initWithTitle:h.framework action:nil keyEquivalent:@""];
-    i.attributedTitle = [self rowTitle:h];
+    NSString *state = h.clients.count ? [@"in " stringByAppendingString:h.clients.firstObject] : StateWords(h);
+    NSString *sub = [NSString stringWithFormat:@"%@ · %@ · up %@ · %@", h.framework, LHFormatBytes(h.memory),
+                     [LHDuration(-h.started.timeIntervalSinceNow) componentsSeparatedByString:@" "].firstObject, Cut(state, 34)];
+    if (ModernMenu()) {
+        if (@available(macOS 14.4, *)) {
+            i.title = [NSString stringWithFormat:@"%@   :%ld", Cut(name, 40), (long)h.port];
+            i.subtitle = sub;
+            if ([StateMark(h, self.review) isEqualToString:@"◇"]) i.badge = [[NSMenuItemBadge alloc] initWithString:@"idle"];
+            else if ([self.plan[h.key][@"stop"] boolValue]) i.badge = [[NSMenuItemBadge alloc] initWithString:@"stops next"];
+        }
+    } else i.attributedTitle = [self rowTitle:h];
+
     NSMenu *m = [NSMenu new];
-    LHVerdict *v = self.review.verdicts[h.key];
-    NSDictionary *intel = LHIntel(h, NO);
-    if (v.about.length) Header(m, v.about);
-    NSString *what = WhatWords(h, v, intel), *how = HowWords(h, v, intel);
-    if (what) Header(m, [@"What: " stringByAppendingString:Cut(what, 100)]).toolTip = what;
-    Header(m, [@"How: " stringByAppendingString:Cut(how, 100)]).toolTip = how;
-    if ([h.kind isEqualToString:@"dev"]) {
-        NSString *why = v.why.length ? v.why : intel ? SessionWords(intel[@"session"]) : @"looking for the agent session…";
-        Header(m, [@"Why: " stringByAppendingString:Cut(why, 100)]).toolTip = why;
-    }
-    NSString *waste = v.waste.length ? [NSString stringWithFormat:@"%@ (%@)", v.waste, WasteWords(h)] : WasteWords(h);
-    Header(m, [@"Waste: " stringByAppendingString:Cut(waste, 100)]).toolTip = waste;
-    if (h.duplicates.count) Header(m, [NSString stringWithFormat:@"Duplicate: same folder and branch as :%@", [[h.duplicates valueForKey:@"stringValue"] componentsJoinedByString:@", :"]]);
-    if (v.recommendation.length) Header(m, [@"Advice: " stringByAppendingString:Cut(v.recommendation, 100)]).toolTip = v.recommendation;
-    NSDictionary *p = self.plan[h.key];
-    if (p) {
-        NSString *line = [NSString stringWithFormat:@"%@: %@, %@", ModeLabel(Mode()), [p[@"stop"] boolValue] ? @"stop" : @"keep", p[@"why"]];
-        Header(m, Cut(line, 110)).toolTip = line;
-    }
-    if (GitWords(intel[@"git"], h)) Header(m, [@"Git: " stringByAppendingString:Cut(GitWords(intel[@"git"], h), 100)]).toolTip = GitWords(intel[@"git"], h);
+    [m addItem:[self cardFor:h]];
     [m addItem:NSMenuItem.separatorItem];
-    if (h.title.length) Header(m, [NSString stringWithFormat:@"Page: %@ (HTTP %ld)", h.title, (long)h.httpStatus]);
-    Header(m, [NSString stringWithFormat:@"%@ · %@", h.cwd.stringByAbbreviatingWithTildeInPath ?: @"?", h.branch ? [NSString stringWithFormat:@"branch %@", h.branch] : @"no git"]);
-    if (h.worktree) Header(m, [NSString stringWithFormat:@"Worktree %@ of %@", h.worktree, h.repo]);
-    Header(m, [@"Command: " stringByAppendingString:Cut(h.command, 90)]).toolTip = h.command;
-    Header(m, [@"Started by: " stringByAppendingString:h.launcher.length ? h.launcher : @"unknown"]);
-    Header(m, [NSString stringWithFormat:@"Up %@ · CPU %@ now, %@ total · %@ in %@", LHDuration(-h.started.timeIntervalSinceNow), Pct(h.cpuPercent),
-               LHDuration(h.cpuSeconds), LHFormatBytes(h.memory), Plural(h.processCount, @"process")]);
-    Header(m, [NSString stringWithFormat:@"Ports %@ on %@ · pid %d", [[h.ports valueForKey:@"stringValue"] componentsJoinedByString:@", "], h.bind, h.pid]);
-    Header(m, h.clients.count ? [NSString stringWithFormat:@"Connected now: %@ · %@", [h.clients componentsJoinedByString:@", "], StateWords(h)]
-            : [NSString stringWithFormat:@"No clients now · %@", h.lastActive ? [NSString stringWithFormat:@"last activity %@ ago", LHDuration(-h.lastActive.timeIntervalSinceNow)]
-                                                                               : [NSString stringWithFormat:@"no activity in %@ of watching", LHDuration(-h.firstSeen.timeIntervalSinceNow)]]);
-    if (v) Header(m, [NSString stringWithFormat:@"%@: %@ (%.0f%%) · %@", LHModelLabel(self.review.model), v.verdict, v.confidence * 100, Cut(v.reason, 90)]).toolTip = v.reason;
-    [m addItem:NSMenuItem.separatorItem];
-    if (![h.kind isEqualToString:@"service"] || h.httpStatus) {
-        Item(m, [@"Open " stringByAppendingString:h.url], @selector(openHost:), self, NO).representedObject = h;
-        Item(m, @"Copy URL", @selector(copyURL:), self, NO).representedObject = h;
+    NSDictionary *where = LHWhere(h, NO);
+    if (where && ![where[@"label"] hasSuffix:@"has closed"]) {
+        NSString *to = [where[@"tab"] length] ? [NSString stringWithFormat:@"Go to “%@”", Cut(where[@"tab"], 40)] : [@"Go to " stringByAppendingString:where[@"app"]];
+        Item(m, to, @selector(goTo:), self, NO).representedObject = where;
     }
-    if (h.cwd.length > 1) Item(m, @"Reveal Folder in Finder", @selector(reveal:), self, NO).representedObject = h;
-    Item(m, @"Copy Restart Command", @selector(copyRestart:), self, NO).representedObject = h;
+    if (![h.kind isEqualToString:@"service"] || h.httpStatus) Item(m, [@"Open " stringByAppendingString:h.url], @selector(openHost:), self, NO).representedObject = h;
+    if (h.cwd.length > 1) Item(m, @"Reveal in Finder", @selector(reveal:), self, NO).representedObject = h;
     [m addItem:NSMenuItem.separatorItem];
-    Item(m, @"Protect (Close Idle Never Stops It)", @selector(toggleProtect:), self, [LHRules.shared protectsPort:h.port]).representedObject = h;
     NSDate *kept = KeptUntil(h);
-    Item(m, kept ? [NSString stringWithFormat:@"Kept for %@ More (Click to Release)", LHDuration(kept.timeIntervalSinceNow)] : @"Keep for 4 Hours",
+    Item(m, kept ? [NSString stringWithFormat:@"Kept for %@ More", LHDuration(kept.timeIntervalSinceNow)] : @"Keep for 4 Hours",
          @selector(toggleKeep:), self, kept != nil).representedObject = h;
     Item(m, @"Stop", @selector(stopOne:), self, NO).representedObject = h;
-    Item(m, @"Force Stop", @selector(killOne:), self, NO).representedObject = h;
+    NSMenu *more = [NSMenu new];
+    if (![h.kind isEqualToString:@"service"] || h.httpStatus) Item(more, @"Copy URL", @selector(copyURL:), self, NO).representedObject = h;
+    Item(more, @"Copy Restart Command", @selector(copyRestart:), self, NO).representedObject = h;
+    Item(more, @"Protect", @selector(toggleProtect:), self, [LHRules.shared protectsPort:h.port]).representedObject = h;
+    [more addItem:NSMenuItem.separatorItem];
+    Item(more, @"Force Stop", @selector(killOne:), self, NO).representedObject = h;
+    Sub(m, @"More", more);
     i.submenu = m;
     return i;
 }
@@ -1020,130 +1199,130 @@ static NSMenuItem *Sub(NSMenu *m, NSString *t, NSMenu *sub) { NSMenuItem *i = It
     NSArray *quiet = [devs filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"state == %d", LHIdle]];
     NSArray *services = [hosts filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"kind == 'service'"]];
     NSArray *others = [hosts filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"kind == 'other'"]];
-    uint64_t mem = 0, idleMem = 0; double cpu = 0;
-    for (LHHost *h in hosts) { mem += h.memory; cpu += h.cpuPercent; }
+    uint64_t idleMem = 0; double cpu = 0;
+    for (LHHost *h in hosts) cpu += h.cpuPercent;
     for (LHHost *h in idle) idleMem += h.memory;
 
     NSMutableDictionary *plan = [NSMutableDictionary new];
     for (NSDictionary *p in Plan(hosts, r, Mode(), NO)) plan[[p[@"host"] key]] = p;
     self.plan = plan;
 
+    // The start every dev server's name shares, up to a dash, such as "barkpark-", is left out of the rows.
+    NSString *common = nil;
+    for (LHHost *h in devs) common = common ? [common commonPrefixWithString:ShortName(h) options:0] : ShortName(h);
+    NSRange dash = [common rangeOfString:@"-" options:NSBackwardsSearch];
+    self.prefix = devs.count > 1 && dash.location != NSNotFound && dash.location >= 3 ? [common substringToIndex:dash.location + 1] : nil;
+
     NSMenu *menu = [NSMenu new];
-    Header(menu, [NSString stringWithFormat:@"%@ · %lu in use · %lu quiet · %@ CPU · %@", Plural(devs.count + services.count, @"localhost"),
-                  (unsigned long)inUse.count, (unsigned long)quiet.count, Pct(cpu), LHFormatBytes(mem)]);
-    if (quiet.count) {
-        double wCPU = 0, wJ = 0; uint64_t wMem = 0;
-        for (LHHost *h in quiet) { wCPU += h.idleCPUSeconds; wJ += h.idleJoules; wMem += h.memory; }
-        Header(menu, [NSString stringWithFormat:@"Quiet servers hold %@ and burned %@ CPU%@ since last use", LHFormatBytes(wMem), LHDuration(wCPU),
-                      wJ > 0 ? [NSString stringWithFormat:@" and %@", Wh(wJ)] : @""]);
-    }
+    uint64_t quietMem = 0; for (LHHost *h in quiet) quietMem += h.memory;
+    NSString *line = [NSString stringWithFormat:@"%@ · %lu in use%@ · %@", Plural(devs.count + services.count, @"localhost"),
+                      (unsigned long)(inUse.count + services.count), quiet.count ? [NSString stringWithFormat:@" · %lu quiet, %@", (unsigned long)quiet.count, LHFormatBytes(quietMem)] : @"", ModeLabel(Mode())];
+    NSMenuItem *head = [NSMenuItem new];
+    head.view = MenuHeader([hosts filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"kind != 'other'"]], r, line, cpu);
+    [menu addItem:head];
+
     [menu addItem:NSMenuItem.separatorItem];
 
-    NSMenuItem *go = Item(menu, idle.count ? [NSString stringWithFormat:@"Close Idle: stop %@ (%@)", Plural(idle.count, @"server"), LHFormatBytes(idleMem)]
-                                           : @"Close Idle: nothing confirmed idle", @selector(closeIdle), self, NO);
-    go.enabled = idle.count > 0;
-    go.image = [NSImage imageWithSystemSymbolName:@"bolt.fill" accessibilityDescription:nil];
-    go.toolTip = [NSString stringWithFormat:@"A server is confirmed idle when it has been quiet for %ld minutes, has no connection now, the last review called it idle, and nothing happened since that review. Services and protected ports are never included.", (long)IdleMinutes()];
-    NSString *label = LHModelLabel(Model());
-    NSMenuItem *rv = Item(menu, self.reviewing ? [NSString stringWithFormat:@"Reviewing with %@…", label] : [NSString stringWithFormat:@"Review Now with %@", label],
-                          @selector(reviewNow), self, NO);
-    rv.enabled = !self.reviewing && hosts.count;
-    rv.image = [NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:nil];
-    if (r) Header(menu, r.error ? [NSString stringWithFormat:@"   Last review failed: %@", Cut(r.error, 70)]
-                              : [NSString stringWithFormat:@"   Last review %@ ago by %@%@ · %@ · %@ · %.0fs", LHDuration(-r.at.timeIntervalSinceNow),
-                                 LHModelLabel(r.model), r.trigger && ![r.trigger isEqualToString:@"manual"] ? [@", woken by " stringByAppendingString:r.trigger] : @"",
-                                 Plural(r.hostCount, @"host"), Tokens(r.tokens), r.seconds]).toolTip = r.error ?: r.note;
-    if (r.summary.length) for (NSString *line in Wrap(r.summary, 78)) Header(menu, [@"   " stringByAppendingString:line]);
-    if (r.actions.count) {
-        NSMutableArray *ports = [NSMutableArray new];
-        for (NSDictionary *a in r.actions) [ports addObject:[NSString stringWithFormat:@":%@%@", a[@"port"], [a[@"stopped"] boolValue] ? @"" : @" (still running)"]];
-        Header(menu, [NSString stringWithFormat:@"   %@ stopped %@ after it: %@", [r.mode capitalizedString] ?: @"The mode", Plural(r.actions.count, @"server"),
-                      [ports componentsJoinedByString:@", "]]);
-    }
+    // What is going on, in up to four readable lines. The review's details sit under Review Now.
+    if (r.summary.length) [menu addItem:TextItem(r.summary, 4)];
+    else if (r.error) [menu addItem:TextItem([@"The last review failed: " stringByAppendingString:r.error], 3)];
     [menu addItem:NSMenuItem.separatorItem];
+    if (idle.count) {
+        NSMenuItem *go = Item(menu, @"Close Idle", @selector(closeIdle), self, NO);
+        go.attributedTitle = Titled(@"Close Idle", [NSString stringWithFormat:@"%@ · %@", Plural(idle.count, @"server"), LHFormatBytes(idleMem)]);
+        go.toolTip = [NSString stringWithFormat:@"Quiet for %ld minutes, called idle by the last review, and nothing since. Services and protected ports are never included.", (long)IdleMinutes()];
+    }
+    NSMenuItem *rv = Item(menu, self.reviewing ? @"Reviewing…" : @"Review Now", @selector(reviewNow), self, NO);
+    rv.attributedTitle = Titled(rv.title, self.reviewing ? LHModelLabel(Model()) : r ? [NSString stringWithFormat:@"%@ ago", LHDuration(-r.at.timeIntervalSinceNow)] : @"");
+    rv.toolTip = r ? [NSString stringWithFormat:@"Last review by %@, %@, %.0f s%@%@", LHModelLabel(r.model), Tokens(r.tokens), r.seconds,
+                      r.trigger && ![r.trigger isEqualToString:@"manual"] ? [@", woken by " stringByAppendingString:r.trigger] : @"", r.note ? [@". " stringByAppendingString:r.note] : @""] : nil;
+    rv.enabled = !self.reviewing && hosts.count;
 
     if (!hosts.count) Header(menu, @"No localhosts running");
-    if (inUse.count) { Header(menu, [NSString stringWithFormat:@"In use (%lu)", (unsigned long)inUse.count]); for (LHHost *h in inUse) [menu addItem:[self hostItem:h]]; }
-    if (quiet.count) { Header(menu, [NSString stringWithFormat:@"Quiet for %ldm or more (%lu)", (long)IdleMinutes(), (unsigned long)quiet.count]); for (LHHost *h in quiet) [menu addItem:[self hostItem:h]]; }
-    if (services.count) { Header(menu, [NSString stringWithFormat:@"Services (%lu)", (unsigned long)services.count]); for (LHHost *h in services) [menu addItem:[self hostItem:h]]; }
-    if (others.count) {
-        NSMenu *om = [NSMenu new];
-        for (LHHost *h in others) [om addItem:[self hostItem:h]];
-        Sub(menu, [NSString stringWithFormat:@"Other listeners, high ports (%lu)", (unsigned long)others.count], om);
-    }
-    if (self.scanner.ignored.count) {
-        NSMenu *im = [NSMenu new];
-        for (LHIgnored *i in self.scanner.ignored)
-            Header(im, [NSString stringWithFormat:@"%@   :%@   (pid %d)", i.name, [[i.ports valueForKey:@"stringValue"] componentsJoinedByString:@", :"], i.pid]);
-        [im addItem:NSMenuItem.separatorItem];
-        Header(im, @"macOS services and apps. LocoHost never touches them.");
-        Sub(menu, [NSString stringWithFormat:@"Ignored, apps and macOS (%lu)", (unsigned long)self.scanner.ignored.count], im);
-    }
+    if (inUse.count) { Section(menu, @"In use"); for (LHHost *h in inUse) [menu addItem:[self hostItem:h]]; }
+    if (quiet.count) { Section(menu, @"Quiet"); for (LHHost *h in quiet) [menu addItem:[self hostItem:h]]; }
+    if (services.count) { Section(menu, @"Services"); for (LHHost *h in services) [menu addItem:[self hostItem:h]]; }
+    [menu addItem:NSMenuItem.separatorItem];
     NSArray *closed = Closed();
     if (closed.count) {
         NSMenu *cm = [NSMenu new];
         for (NSDictionary *c in closed) {
             NSMenu *sm = [NSMenu new];
-            if ([c[@"why"] length]) for (NSString *line in Wrap(c[@"why"], 80)) Header(sm, line);
-            Header(sm, Cut(c[@"restart"], 90)).toolTip = c[@"restart"];
+            if ([c[@"why"] length]) for (NSString *line in Wrap(c[@"why"], 64)) Header(sm, line);
+            Header(sm, Cut(c[@"restart"], 70)).toolTip = c[@"restart"];
             [sm addItem:NSMenuItem.separatorItem];
             NSMenuItem *ri = Item(sm, @"Restart", @selector(restartClosed:), self, NO);
             ri.representedObject = c; ri.enabled = !LHPortListening([c[@"port"] integerValue]);
             Item(sm, @"Copy Restart Command", @selector(copyClosed:), self, NO).representedObject = c[@"restart"];
-            Sub(cm, [NSString stringWithFormat:@":%@  %@  %@   %@ ago by %@", c[@"port"], c[@"framework"], c[@"project"],
-                     LHDuration(NSDate.date.timeIntervalSince1970 - [c[@"at"] doubleValue]), c[@"by"] ?: @"you"], sm);
+            NSMenuItem *ci = Sub(cm, @"", sm);
+            ci.attributedTitle = Titled([NSString stringWithFormat:@":%@  %@", c[@"port"], c[@"framework"]],
+                                        [NSString stringWithFormat:@"%@ ago by %@", LHDuration(NSDate.date.timeIntervalSince1970 - [c[@"at"] doubleValue]), c[@"by"] ?: @"you"]);
         }
         [cm addItem:NSMenuItem.separatorItem];
         Item(cm, @"Clear", @selector(clearClosed), self, NO);
-        Sub(menu, [NSString stringWithFormat:@"Recently stopped (%lu)", (unsigned long)closed.count], cm);
+        Sub(menu, @"Recently Stopped", cm);
     }
-    [menu addItem:NSMenuItem.separatorItem];
+    if (others.count) {
+        NSMenu *om = [NSMenu new];
+        for (LHHost *h in others) [om addItem:[self hostItem:h]];
+        Sub(menu, @"Other Listeners", om);
+    }
 
+    NSMenu *set = [NSMenu new];
     NSMenu *modes = [NSMenu new];
     NSArray *modeHelp = @[@"Reviews and reports. Stops nothing by itself.",
-                          @"Stops obvious waste: quiet 6 hours, no agent, the review sure it is idle.",
-                          @"Stops every quiet server that can't show evidence someone needs it."];
+                          @"Stops obvious waste: quiet 6 hours, no agent, the review sure.",
+                          @"Stops every quiet server that can't show evidence it's needed."];
     for (LHMode m = LHModeIdle; m <= LHModeEager; m++) {
-        NSMenuItem *mi = Item(modes, ModeLabel(m), @selector(setMode:), self, Mode() == m);
-        mi.tag = m; mi.toolTip = modeHelp[m];
+        NSMenuItem *mi = Item(modes, @"", @selector(setMode:), self, Mode() == m);
+        mi.attributedTitle = Titled(ModeLabel(m), modeHelp[m]); mi.tag = m;
     }
     [modes addItem:NSMenuItem.separatorItem];
-    for (NSString *t in modeHelp) Header(modes, [NSString stringWithFormat:@"%@: %@", ModeLabel((LHMode)[modeHelp indexOfObject:t]), t]);
-    Header(modes, @"Every mode keeps servers used in the quiet window, started in the");
-    Header(modes, @"last 30 minutes, protected, or with an agent session active in the last hour.");
-    Sub(menu, [NSString stringWithFormat:@"Mode: %@", ModeLabel(Mode())], modes);
-    NSMenu *every = [NSMenu new];
-    for (NSNumber *m in @[@0, @15, @30, @60, @120, @240])
-        Item(every, m.integerValue ? LHDuration(m.integerValue * 60) : @"Off", @selector(setReviewEvery:), self, PrefInt(kReviewMinKey, 60) == m.integerValue).tag = m.integerValue;
-    Sub(menu, @"Review Every", every);
+    Header(modes, @"No mode stops a server used in the quiet window, younger than");
+    Header(modes, @"30 minutes, protected, kept, or with an agent active in the last hour.");
+    Sub(set, [NSString stringWithFormat:@"Mode: %@", ModeLabel(Mode())], modes);
     NSMenu *models = [NSMenu new];
     BOOL known = NO;
     for (NSArray *m in LHModels()) { BOOL on = [Model() isEqualToString:m[0]]; known |= on; Item(models, m[1], @selector(setModel:), self, on).representedObject = m[0]; }
     if (!known) Item(models, Model(), NULL, nil, YES).enabled = NO;
     [models addItem:NSMenuItem.separatorItem];
-    Header(models, @"Haiku or Luna: Haiku first, Luna when Claude is out of usage.");
-    Header(models, @"Claude runs through the claude CLI, Luna through codex,");
-    Header(models, @"both on your own login, with no tools.");
-    Header(models, @"defaults write no.guerrilla.locohost locohost.model <name>");
-    Sub(menu, [NSString stringWithFormat:@"Model: %@", label], models);
+    Header(models, @"Haiku first, Luna when Claude is out of usage.");
+    Header(models, @"Both on your own login, with no tools.");
+    Sub(set, [NSString stringWithFormat:@"Model: %@", LHModelLabel(Model())], models);
+    NSMenu *every = [NSMenu new];
+    for (NSNumber *m in @[@0, @15, @30, @60, @120, @240])
+        Item(every, m.integerValue ? LHDuration(m.integerValue * 60) : @"Off", @selector(setReviewEvery:), self, PrefInt(kReviewMinKey, 60) == m.integerValue).tag = m.integerValue;
+    [every addItem:NSMenuItem.separatorItem];
+    Header(every, @"New servers, long uptimes and memory pressure also wake a review.");
+    Sub(set, [NSString stringWithFormat:@"Review Every: %@", PrefInt(kReviewMinKey, 60) ? LHDuration(PrefInt(kReviewMinKey, 60) * 60) : @"Off"], every);
     NSMenu *quietAfter = [NSMenu new];
     for (NSNumber *m in @[@10, @30, @60, @120, @360])
         Item(quietAfter, LHDuration(m.integerValue * 60), @selector(setIdle:), self, IdleMinutes() == m.integerValue).tag = m.integerValue;
-    Sub(menu, @"Quiet After", quietAfter);
+    Sub(set, [NSString stringWithFormat:@"Quiet After: %@", LHDuration(IdleMinutes() * 60)], quietAfter);
     NSMenu *f = [NSMenu new];
     Item(f, @"Ask Me", @selector(setForce:), self, ForceMode() == LHForceAsk).tag = LHForceAsk;
     Item(f, @"Force Stop It", @selector(setForce:), self, ForceMode() == LHForceAlways).tag = LHForceAlways;
     Item(f, @"Leave It Running", @selector(setForce:), self, ForceMode() == LHForceNever).tag = LHForceNever;
     [f addItem:NSMenuItem.separatorItem];
     Header(f, [NSString stringWithFormat:@"Servers get SIGTERM and %.0f seconds first.", kGrace]);
-    Sub(menu, @"When a Server Won't Stop", f);
-    Item(menu, @"Ask Before Closing", @selector(toggleAsk), self, PrefBool(kAskKey, YES));
-    Item(menu, @"Read Page Titles", @selector(toggleProbe), self, PrefBool(kProbeKey, YES)).toolTip = @"Sends GET / to each dev server every 5 minutes to read its page title.";
-    Item(menu, @"Edit Rules…", @selector(editRules), self, NO);
-    Item(menu, @"Launch at Login", @selector(toggleLogin), self, SMAppService.mainAppService.status == SMAppServiceStatusEnabled);
-    [menu addItem:NSMenuItem.separatorItem];
-    Header(menu, [NSString stringWithFormat:@"LocoHost %@ · watching for %@", NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"",
-                  LHDuration(-self.scanner.watchingSince.timeIntervalSinceNow)]);
+    Sub(set, @"When a Server Won't Stop", f);
+    [set addItem:NSMenuItem.separatorItem];
+    Item(set, @"Ask Before Closing", @selector(toggleAsk), self, PrefBool(kAskKey, YES));
+    Item(set, @"Read Page Titles", @selector(toggleProbe), self, PrefBool(kProbeKey, YES)).toolTip = @"Sends GET / to each dev server every 5 minutes to read its page title.";
+    Item(set, @"Launch at Login", @selector(toggleLogin), self, SMAppService.mainAppService.status == SMAppServiceStatusEnabled);
+    Item(set, @"Edit Rules…", @selector(editRules), self, NO);
+    if (self.scanner.ignored.count) {
+        NSMenu *im = [NSMenu new];
+        for (LHIgnored *i in self.scanner.ignored)
+            Header(im, [NSString stringWithFormat:@"%@   :%@", i.name, [[i.ports valueForKey:@"stringValue"] componentsJoinedByString:@", :"]]);
+        [im addItem:NSMenuItem.separatorItem];
+        Header(im, @"macOS services and apps. LocoHost never touches them.");
+        Sub(set, [NSString stringWithFormat:@"Ignored Listeners (%lu)", (unsigned long)self.scanner.ignored.count], im);
+    }
+    [set addItem:NSMenuItem.separatorItem];
+    Header(set, [NSString stringWithFormat:@"LocoHost %@ · watching for %@", NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"",
+                 LHDuration(-self.scanner.watchingSince.timeIntervalSinceNow)]);
+    Sub(menu, @"Settings", set);
     Item(menu, @"Quit LocoHost", @selector(quit), self, NO).keyEquivalent = @"q";
 
     self.statusItem.menu = menu;
@@ -1232,6 +1411,14 @@ static void Copy(NSString *s) { [NSPasteboard.generalPasteboard clearContents]; 
 - (void)copyRestart:(NSMenuItem *)i { LHHost *h = i.representedObject; Copy(h.restartCommand); }
 - (void)copyClosed:(NSMenuItem *)i  { Copy(i.representedObject); }
 - (void)clearClosed                 { SetClosed(@[]); }
+- (void)goTo:(NSMenuItem *)i {
+    NSString *e = nil;
+    if (LHGoTo(i.representedObject, &e) || !e) return;
+    NSAlert *a = [NSAlert new];
+    a.messageText = [NSString stringWithFormat:@"Could not go to %@", i.representedObject[@"app"]];
+    a.informativeText = e;
+    [NSApp activateIgnoringOtherApps:YES]; [a runModal];
+}
 - (void)toggleKeep:(NSMenuItem *)i  { LHHost *h = i.representedObject; SetKeep(h, KeptUntil(h) ? 0 : 4); }
 - (void)restartClosed:(NSMenuItem *)i {
     NSDictionary *c = i.representedObject; NSString *e = nil;

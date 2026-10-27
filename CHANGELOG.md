@@ -15,9 +15,11 @@ All notable changes to LocoHost. Format follows [Keep a Changelog](https://keepa
 - Reviews wake on events as well as the schedule: a new dev server, uptime passing a day, three days or a week, memory pressure, and sustained load. Event reviews are at least ten minutes apart.
 - Each review writes a summary of the whole Mac, shown at the top of the menu and by `locohost summary`.
 - `locohost mode`, `locohost summary` and `locohost auto` with `--dry-run`, `--mode` and `--port`. Stops by a mode are recorded with the mode and the reason, and announced in a notification.
+- Where each server runs: its cmux tab, tmux pane, Terminal or iTerm2 tab, or the app it came from. *Go to* in a row's menu and `locohost where <port> --go` bring it forward.
+- A calmer menu: memory in large type, the summary as readable text, native rows with a short second line, and a hover card that says in plain words why a server is still running.
 - *Keep for 4 Hours* on a row and `locohost keep <port> [hours]` hold a server back from every mode.
 - *Restart* in Recently Stopped and `locohost restart <port>` start a stopped server again from its recorded command.
-- `test.sh` has 53 checks, including each mode, the judge, keep evidence, an active agent session, keep and restart.
+- `test.sh` has 54 checks, including each mode, the judge, keep evidence, an active agent session, keep, restart and where a server runs in tmux.
 
 ### Fixed
 - On launch, every running server counted as new and woke a review at once.

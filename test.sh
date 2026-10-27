@@ -132,6 +132,19 @@ r=$("$BIN" auto --mode eager --port "$P" --json | json "j['plan'][0]['why'].star
 r=$(plan --mode eager --dry-run);                                  check "and releasing it hands it back to the mode" True "$r"
 unset LOCOHOST_IDLE_MINUTES LOCOHOST_MIN_UPTIME_MINUTES
 
+echo "== where a server runs"
+TMUX_BIN=$(command -v tmux || true)
+if [ -n "$TMUX_BIN" ]; then
+  W=$("$BIN" free $((P + 1)))
+  "$TMUX_BIN" new-session -d -s "locohost-test-$$" -n fixture "cd '$LOCOHOST_HOME' && exec python3 -m http.server $W --bind 127.0.0.1"
+  "$BIN" ready "$W" --timeout 10 >/dev/null
+  r=$("$BIN" where "$W" --json | json "j.get('kind','none')")
+  "$TMUX_BIN" kill-session -t "locohost-test-$$" 2>/dev/null
+  check "where names the tmux pane a server runs in" tmux "$r"
+else
+  echo "  skip  tmux is not installed"
+fi
+
 echo "== a failed review closes nothing"
 LOCOHOST_TEST_CLAUDE_LIMIT=1 LOCOHOST_CODEX=/usr/bin/false "$BIN" review --model auto >/dev/null 2>&1
                                                                     check "both models failing exits 1" 1 "$?"

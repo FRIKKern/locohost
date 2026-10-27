@@ -7,6 +7,7 @@ locohost list                    # every localhost, with state and who started i
 locohost list --json             # the same for agents, plus the ignored listeners and Close Idle candidates
 locohost who 3000                # who holds :3000, its folder, branch, command and clients
 locohost explain 3000            # what it is, how it runs, why it is there, what it wastes, with the evidence
+locohost where 3000              # the cmux tab, tmux pane, terminal tab or app it runs in; --go brings it forward
 locohost waste                   # every server ranked by CPU, energy and memory since it was last used
 locohost ready 3000 --http       # wait until :3000 answers HTTP; exit 0 ready, 1 timed out (--timeout 60)
 locohost free 3000               # the first free port at or above 3000

@@ -29,6 +29,8 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>100</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>LocoHost selects the Terminal or iTerm2 tab a server runs in when you choose Go to.</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>

@@ -21,6 +21,7 @@ LocoHost investigates every dev server before it asks the model. [What it reads]
 - **What it is.** The name, description and script from `package.json`, the first lines of the README, the app in `mix.exs` or `pyproject.toml`, and the names of its config files. It never opens `.env` files.
 - **Why it is there.** The Claude Code, Codex or pi session that started it, with its title and when it was last active. When no session matches, LocoHost says "no agent session found" instead of guessing.
 - **Where the work stands.** The last commit, uncommitted files, whether the remote branch still exists, and how many commits are not in the default branch yet.
+- **Where it runs.** The cmux tab, tmux pane, Terminal or iTerm2 tab, or the app it came from, such as "cmux › Frikkern repo check". *Go to* in the row's menu brings that tab forward.
 - **What it wastes.** CPU time, energy in Wh and memory held since anyone last used it, from the kernel's own counters for the whole process tree. Two servers on the same folder and branch are flagged as duplicates.
 
 The model turns this into five short sentences per server: what, how, why, waste and a recommendation. `locohost explain 3317` prints them with the evidence:
@@ -94,6 +95,7 @@ pnpm dev --port "$PORT" &
 locohost ready "$PORT" --http --timeout 90     # exit 0 once it answers HTTP
 locohost who 3000                              # who holds :3000, from which folder and branch
 locohost explain 3000                          # what it is, why it is there, what it wastes
+locohost where 3000 --go                       # the terminal tab or agent app it runs in, brought forward
 locohost waste                                 # every server ranked by what it burns unused
 locohost summary                               # what is going on, and what the mode would stop
 ```
@@ -107,7 +109,7 @@ git clone https://github.com/FRIKKern/locohost.git && cd locohost
 ./build.sh && ./test.sh
 ```
 
-Objective-C built with clang alone. No Xcode project, no Swift, no packages. `test.sh` runs 53 checks against its own Python servers and fake `claude` and `codex` CLIs, and never touches another server.
+Objective-C built with clang alone. No Xcode project, no Swift, no packages. `test.sh` runs 54 checks against its own Python servers and fake `claude` and `codex` CLIs, and never touches another server.
 
 | I want to … | Read this |
 |---|---|

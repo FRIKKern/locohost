@@ -22,6 +22,17 @@ For each dev server LocoHost gathers more evidence on a background queue, cached
 
 `locohost explain <port>` prints this evidence with the model's five sentences. `locohost waste` ranks every server by what it burns unused.
 
+## Where it runs
+
+Every 30 seconds LocoHost finds the terminal or app each server runs in, in the background:
+
+- **cmux.** `cmux top --all --processes` lists every process under its window, workspace and tab. cmux tracks its processes itself, so a server whose shell has exited is still found in its tab.
+- **tmux.** `tmux list-panes -a` gives each pane's shell, matched against the server's parents. When the tmux client runs in a cmux tab, Go to opens that tab first.
+- **Terminal and iTerm2.** The terminal device of the nearest shell above the server, matched against each tab's device through AppleScript. macOS asks once for permission when you first choose Go to.
+- **Anything else,** such as Ghostty, Warp, VS Code, Cursor or the Claude and ChatGPT apps: the app macOS holds responsible for the process. That link survives the parent exiting. Go to brings the app forward; it cannot pick a tab or a conversation.
+
+When the tab that started a server has closed, LocoHost says so. That alone often answers whether anyone still needs it. `locohost where <port>` prints the place, and `--go` brings it forward.
+
 ## Activity
 
 Activity means a new connection since the last sample, or CPU well above the server's own lifetime average for two samples in a row.

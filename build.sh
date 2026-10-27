@@ -7,7 +7,7 @@ APP=build/LocoHost.app
 rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 clang -fobjc-arc -O2 -Wall -mmacosx-version-min=13.0 -arch arm64 -arch x86_64 \
   -framework Cocoa -framework ServiceManagement -framework UserNotifications \
-  Sources/main.m Sources/Ports.m Sources/Rules.m Sources/Review.m Sources/Intel.m -o "$APP/Contents/MacOS/LocoHost"
+  Sources/main.m Sources/Ports.m Sources/Rules.m Sources/Review.m Sources/Intel.m Sources/Where.m -o "$APP/Contents/MacOS/LocoHost"
 cp Info.plist "$APP/Contents/"
 [ -f AppIcon.icns ] && cp AppIcon.icns "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
