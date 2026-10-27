@@ -10,7 +10,12 @@ All notable changes to LocoHost. Format follows [Keep a Changelog](https://keepa
 - Investigation of every dev server: the project's package.json, README, mix.exs or pyproject.toml, git state, and the Claude Code, Codex or pi session that started it. `.env` files are never opened.
 - Waste per server: CPU time, energy in Wh and memory held since it was last used, from the kernel's counters for the whole process tree. Duplicates on the same folder and branch are flagged.
 - The review returns what, how, why, waste and a recommendation for each server. They show in each row's submenu, in `locohost explain <port>` and in `locohost who`. `locohost waste` ranks servers by what they burn unused.
-- `test.sh` has 35 checks, including the fallback, the codex flags, redaction on the Luna path, `.env` contents and session prompts.
+
+- Three modes. Idle reviews and reports. Proactive stops servers quiet for six hours with no agent above them that the review is sure about. Eager, the default, stops every quiet server that can't show evidence that someone needs it, after a second model pass, the judge. No mode stops a server used in the quiet window, younger than 30 minutes, protected, or with an agent session active in the last hour.
+- Reviews wake on events as well as the schedule: a new dev server, uptime passing a day, three days or a week, memory pressure, and sustained load. Event reviews are at least ten minutes apart.
+- Each review writes a summary of the whole Mac, shown at the top of the menu and by `locohost summary`.
+- `locohost mode`, `locohost summary` and `locohost auto` with `--dry-run`, `--mode` and `--port`. Stops by a mode are recorded with the mode and the reason, and announced in a notification.
+- `test.sh` has 49 checks, including each mode, the judge, keep evidence and an active agent session.
 
 ### Fixed
 - Connections from the CLI's own probe counted as visits in the menu bar app. Connections from every LocoHost process are now excluded.

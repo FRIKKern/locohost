@@ -1,6 +1,10 @@
 # The review
 
-On a schedule, hourly by default, and when you press *Review Now*, LocoHost asks a model which servers you still use. The answer is one verdict per server, `in_use`, `idle` or `unsure`, with a confidence and a one-sentence reason. It also has five short sentences: what the server is, how it runs, why it is there, what it wastes, and a recommendation.
+On a schedule, hourly by default, and when you press *Review Now*, LocoHost asks a model which servers you still use. The answer is one verdict per server, `in_use`, `idle` or `unsure`, with a confidence and a one-sentence reason. It also has five short sentences: what the server is, how it runs, why it is there, what it wastes, and a recommendation. It names the one fact that shows someone still needs the server, as `keep_evidence`, or leaves it empty. And it writes a summary of the whole Mac in three or four sentences.
+
+## The judge
+
+In Eager mode a second pass follows for every quiet server the first pass did not call clearly idle. The judge gets the same facts plus the first verdict, and the burden of proof is on the server. It answers keep or stop for each, with the evidence for keep and one sentence of reason. Evidence that counts is a recent request, an agent session active in the last hour, a repo touched in the last half hour, or another local server connected to it. An open tab with no new requests, a live agent whose session has been quiet for hours, and old commits do not count. The judge uses the same model choice and the same no-tools command as the review.
 
 ## Haiku or Luna
 
@@ -61,5 +65,6 @@ Text is capped at 300 characters, and session text at 200. All of it is redacted
 | GPT-5.6-Luna | 7 | 19 s | about 10.6k |
 | Haiku, with investigation | 7 | 42 s | 17.7k |
 | GPT-5.6-Luna, with investigation | 7 | 19 s | 13.6k |
+| Haiku, Eager with the judge on 2 servers | 7 | 52 s | 22.6k |
 
 These are single runs on one Mac on 2026-10-26 and 2026-10-27.

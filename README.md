@@ -4,7 +4,7 @@
 
 **Every localhost on your Mac, and whether you still use it.**
 
-LocoHost is a free menu bar app for Macs that run many coding agents and git worktrees at once. Each agent starts a dev server, the agent finishes, and the server keeps running for days. LocoHost lists every one of them and finds out what each one is, why it is there, and what it burns while nobody uses it. Haiku or Luna, on your own subscription, checks the list every hour. **Close Idle** stops the servers nobody uses, in one click.
+LocoHost is a free menu bar app for Macs that run many coding agents and git worktrees at once. Each agent starts a dev server, the agent finishes, and the server keeps running for days. LocoHost lists every one of them and finds out what each one is, why it is there, and what it burns while nobody uses it. Haiku or Luna, on your own subscription, checks the list every hour and whenever something changes, writes a short summary of what is going on, and stops what nobody uses.
 
 Free and MIT licensed · macOS 13 or newer · [Install](#install) · [How it works](docs/HOW-IT-WORKS.md) · [The review](docs/REVIEW.md)
 
@@ -33,13 +33,37 @@ Waste     Holds 741 MB; 0 CPU minutes and 0.002 Wh since last activity, 2 minute
 Advice    Keep: it was active 2 minutes ago and has local commits ahead of its upstream; recheck after 30 quiet minutes.
 ```
 
+## Three modes
+
+| Mode | What it does |
+|---|---|
+| **Idle** | Reviews and reports. Stops nothing by itself. *Close Idle* in the menu stays one click away. |
+| **Proactive** | Stops obvious waste: a server quiet for six hours, with no agent above it, that the review is sure nobody uses. |
+| **Eager**, the default | Stops every quiet server that can't show evidence that someone still needs it. A second model pass, the judge, looks at each one that is not clearly idle. |
+
+In Eager the burden of proof is on the server. Evidence is a new request, an agent session active in the last hour, a repo touched in the last half hour, or another local server connected to it. An open tab with no requests, a live agent process whose session has been quiet for hours, or old commits are not evidence. Stopping is cheap, because *Recently Stopped* keeps the command that starts each server again.
+
+No mode stops a server that was used within the quiet window, started in the last 30 minutes, is protected, or whose agent session was active in the last hour. A mode never force stops unless your setting says so, and a notification lists everything it stopped.
+
+## When it wakes up
+
+LocoHost samples every five seconds. It reviews on a schedule, hourly by default, and also when one of these happens:
+
+- **A new server appears** and has run for two minutes.
+- **A server passes a day, three days or a week** of uptime.
+- **The Mac struggles.** macOS reports memory pressure, or the load stays above the number of cores for half a minute.
+
+Reviews woken by events are at least ten minutes apart. Each review writes a summary, such as this one from a real run:
+
+> Seven servers are running: five Barkpark dev servers from git worktrees (Vite and Phoenix) plus two shared services, epmd and Postgres. Three dev servers were active within the last minute (ports 3300, 4100 and 4251), and Postgres has 30 clients connected, so those four are in use. The two page-builder Vite servers (ports 3317 and 3318) are the likely leftovers: no browser or agent session, repo untouched about 20 hours, though last activity was 38 minutes ago. Together the seven hold 8,108 MB (3,779 MB across the dev servers) and have used 49.2 Wh in total; I would stop the two page-builder servers after you confirm those branches are done, freeing 1,782 MB, and keep the rest.
+
 ## How LocoHost decides
 
 Closing a server you need costs more than leaving an idle one running. [Step by step](docs/HOW-IT-WORKS.md) · [Rules file](docs/RULES.md)
 
 - **Watches what happens, not what is open.** Activity is a new connection or real CPU work. A forgotten tab with a live-reload socket is not use, and neither is a spinning BEAM scheduler.
 - **Knows who started it.** `pnpm dev` under Claude Code in cmux, a `mix phx.server` whose terminal is gone, or a Playwright browser still connected. A server whose parent exited is the most common leftover.
-- **Asks a model, then checks again.** The review alone never closes anything. Two checks have to agree, and anything that happens after the review cancels it.
+- **Asks a model, then checks again.** The review alone never closes anything. LocoHost's own signals have to agree, and anything that happens after the review cancels it.
 - **Leaves the rest alone.** Postgres, Redis, epmd, Docker and Ollama are never closed, and neither are ports you protect. Spotify, AirPlay and other macOS and app listeners are only listed.
 
 ![Two checks have to agree. One: LocoHost saw no new connection and no real CPU work for 30 minutes. Two: the latest review by Haiku or Luna called the server idle with at least 60 percent confidence, and nothing happened after it. Then Close Idle stops it, dev servers only, with SIGTERM, six seconds, then your setting.](docs/images/close-idle.svg)
@@ -71,6 +95,7 @@ locohost ready "$PORT" --http --timeout 90     # exit 0 once it answers HTTP
 locohost who 3000                              # who holds :3000, from which folder and branch
 locohost explain 3000                          # what it is, why it is there, what it wastes
 locohost waste                                 # every server ranked by what it burns unused
+locohost summary                               # what is going on, and what the mode would stop
 ```
 
 [Every command](docs/CLI.md)
@@ -82,11 +107,11 @@ git clone https://github.com/FRIKKern/locohost.git && cd locohost
 ./build.sh && ./test.sh
 ```
 
-Objective-C built with clang alone. No Xcode project, no Swift, no packages. `test.sh` runs 35 checks against its own Python servers and fake `claude` and `codex` CLIs, and never touches another server.
+Objective-C built with clang alone. No Xcode project, no Swift, no packages. `test.sh` runs 49 checks against its own Python servers and fake `claude` and `codex` CLIs, and never touches another server.
 
 | I want to … | Read this |
 |---|---|
-| understand what LocoHost reads and when it stops a server | [How it works](docs/HOW-IT-WORKS.md) |
+| understand what LocoHost reads, the modes, and when it stops a server | [How it works](docs/HOW-IT-WORKS.md) |
 | see exactly what the model gets and how Luna takes over | [The review](docs/REVIEW.md) |
 | protect a server or hide a listener | [Rules file](docs/RULES.md) |
 | script it or use it from an agent | [CLI](docs/CLI.md) |

@@ -33,5 +33,5 @@ text{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue'
 <path d='M56 444h848' stroke='#4A3358'/>
 <text x='64' y='470'>Other listeners, high ports (2)</text><text x='890' y='470' class='dim' text-anchor='end'>▸</text>
 <text x='64' y='496'>Ignored, apps and macOS (4)</text><text x='890' y='496' class='dim' text-anchor='end'>▸</text>
-<text x='64' y='522' class='dim' style='font-size:13.5px'>Review Every ▸   Model: Haiku or Luna ▸   Quiet After ▸   When a Server Won't Stop ▸</text>
+<text x='64' y='522' class='dim' style='font-size:13.5px'>Mode: Eager ▸   Review Every ▸   Model: Haiku or Luna ▸   Quiet After ▸   When a Server Won't Stop ▸</text>
 </svg>

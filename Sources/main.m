@@ -1,10 +1,12 @@
 // LocoHost: every localhost on your Mac, what it is, who started it, and whether anyone still uses it.
-// Menu bar app + CLI. Haiku or Luna on your own subscription reviews the list on a schedule,
-// and Close Idle stops the servers that both the local signals and the review call idle.
+// Menu bar app + CLI. Haiku or Luna on your own subscription reviews the list on a schedule and when something
+// changes, and the mode decides what happens next: Idle only reports, Proactive stops obvious waste, and Eager
+// stops every quiet server that cannot show evidence that someone still needs it.
 #import <Cocoa/Cocoa.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <signal.h>
 #import <netinet/in.h>
+#import <UserNotifications/UserNotifications.h>
 #import "Ports.h"
 #import "Rules.h"
 #import "Review.h"
@@ -16,10 +18,15 @@ static NSString *const kIdleMinKey   = @"locohost.idleMinutes";     // default 3
 static NSString *const kProbeKey     = @"locohost.probeHTTP";       // default YES
 static NSString *const kAskKey       = @"locohost.askBeforeClosing";// default YES
 static NSString *const kForceKey     = @"locohost.forceMode";       // 0 leave, 1 ask (default), 2 force
+static NSString *const kModeKey      = @"locohost.mode";            // idle | proactive | eager (default)
 
 typedef NS_ENUM(NSInteger, LHForceMode) { LHForceNever = 0, LHForceAsk = 1, LHForceAlways = 2 };
 static const NSTimeInterval kGrace = 6;          // seconds a server gets to stop after SIGTERM
 static const double kMinConfidence = 0.6;        // an idle verdict below this does not count
+static const double kSureConfidence = 0.8;       // an idle verdict this sure needs no second look
+static const NSTimeInterval kSessionFresh = 60 * 60;    // an agent session active this recently keeps its server, in every mode
+static const NSTimeInterval kReviewFresh = 3 * 3600;    // the modes act only on a review this recent
+static const NSTimeInterval kEventGap = 10 * 60;        // reviews woken by events are at least this far apart
 
 #pragma mark - Preferences
 
@@ -37,6 +44,23 @@ static NSInteger IdleMinutes(void) {
     return env.length ? env.integerValue : PrefInt(kIdleMinKey, 30);
 }
 static LHForceMode ForceMode(void) { id v = PrefGet(kForceKey); return v ? (LHForceMode)[v integerValue] : LHForceAsk; }
+
+/// What LocoHost does with what the review finds. Idle reports only. Proactive stops obvious waste: a server quiet for
+/// six hours with no agent above it that the review calls idle with confidence. Eager puts the burden of proof on the
+/// server: every quiet one that is not clearly idle goes to a judge, and stays only with a concrete fact that someone needs it.
+typedef NS_ENUM(NSInteger, LHMode) { LHModeIdle = 0, LHModeProactive = 1, LHModeEager = 2 };
+static NSArray<NSString *> *ModeNames(void) { return @[@"idle", @"proactive", @"eager"]; }
+static NSString *ModeLabel(LHMode m) { return ModeNames()[m].capitalizedString; }
+static NSInteger ModeFrom(NSString *s) { NSUInteger i = [ModeNames() indexOfObject:s.lowercaseString ?: @""]; return i == NSNotFound ? -1 : (NSInteger)i; }
+static LHMode Mode(void) { id v = PrefGet(kModeKey); NSInteger m = [v isKindOfClass:NSString.class] ? ModeFrom(v) : -1; return m < 0 ? LHModeEager : (LHMode)m; }
+
+/// Minutes from a test variable, else the default.
+static NSTimeInterval EnvMinutes(NSString *key, double dflt) {
+    NSString *env = NSProcessInfo.processInfo.environment[key];
+    return (env.length ? env.doubleValue : dflt) * 60;
+}
+static NSTimeInterval MinUptime(void)    { return EnvMinutes(@"LOCOHOST_MIN_UPTIME_MINUTES", 30); }   // younger servers are never stopped by a mode
+static NSTimeInterval ProactiveQuiet(void) { return EnvMinutes(@"LOCOHOST_PROACTIVE_MINUTES", 6 * 60); }
 
 static NSString *Plural(NSInteger n, NSString *word) { return [NSString stringWithFormat:@"%ld %@%@", (long)n, word, n == 1 ? @"" : [word hasSuffix:@"s"] ? @"es" : @"s"]; }
 static NSString *Pct(double v) { return [NSString stringWithFormat:@"%.0f%%", v]; }
@@ -59,6 +83,86 @@ static NSArray<LHHost *> *Candidates(NSArray<LHHost *> *hosts, LHReview *review)
         [c addObject:h];
     }
     return c;
+}
+
+#pragma mark - Modes
+
+static double SessionMinutes(NSDictionary *intel) {
+    id m = intel[@"session"][@"last_active_minutes_ago"];
+    return m ? [m doubleValue] : -1;
+}
+
+/// Why a host stays whatever the mode, or nil when the mode may decide. wait reads the investigation now (the CLI).
+static NSString *MustKeep(LHHost *h, LHReview *r, LHMode mode, BOOL wait) {
+    if (![h.kind isEqualToString:@"dev"]) return @"not a dev server";
+    if (h.isProtected) return @"protected";
+    if (h.state != LHIdle) return h.lastActive ? [NSString stringWithFormat:@"used %@ ago", LHDuration(-h.lastActive.timeIntervalSinceNow)] : @"in use";
+    if (-h.started.timeIntervalSinceNow < MinUptime()) return [NSString stringWithFormat:@"started only %@ ago", LHDuration(-h.started.timeIntervalSinceNow)];
+    if (!r) return @"no review yet";
+    if (r.error) return @"the last review failed";
+    if (-r.at.timeIntervalSinceNow > kReviewFresh) return [NSString stringWithFormat:@"the last review is %@ old", LHDuration(-r.at.timeIntervalSinceNow)];
+    if (h.lastActive && [h.lastActive compare:r.at] == NSOrderedDescending) return @"used after the last review";
+    if (!r.verdicts[h.key]) return @"not in the last review";
+    double session = SessionMinutes(LHIntel(h, wait));
+    if (session >= 0 && session * 60 < kSessionFresh) return [NSString stringWithFormat:@"its agent session was active %@ ago", LHDuration(session * 60)];
+    if (mode != LHModeEager && h.agent && !h.orphaned) return [NSString stringWithFormat:@"%@ still runs above it", h.agent];
+    return nil;
+}
+
+/// For every dev host: stop or keep under this mode, and the one-line reason. Idle mode stops nothing.
+static NSArray<NSDictionary *> *Plan(NSArray<LHHost *> *hosts, LHReview *r, LHMode mode, BOOL wait) {
+    NSMutableArray *plan = [NSMutableArray new];
+    for (LHHost *h in hosts) {
+        if (![h.kind isEqualToString:@"dev"]) continue;
+        NSString *why = MustKeep(h, r, mode, wait);
+        BOOL stop = NO;
+        LHVerdict *v = r.verdicts[h.key];
+        NSString *quiet = LHDuration(-(h.lastActive ?: h.firstSeen).timeIntervalSinceNow);
+        BOOL idle = [v.verdict isEqualToString:@"idle"];
+        if (why) {
+        } else if (mode == LHModeIdle) {
+            why = idle ? [NSString stringWithFormat:@"Idle mode only reports; the review calls it idle: %@", v.reason] : @"Idle mode only reports";
+        } else if (mode == LHModeProactive) {
+            if (-(h.lastActive ?: h.firstSeen).timeIntervalSinceNow < ProactiveQuiet())
+                why = [NSString stringWithFormat:@"quiet %@; Proactive waits %@", quiet, LHDuration(ProactiveQuiet())];
+            else if (idle && v.confidence >= kSureConfidence) { stop = YES; why = [NSString stringWithFormat:@"quiet %@: %@", quiet, v.reason]; }
+            else why = [NSString stringWithFormat:@"the review says %@ (%.0f%%)", v.verdict, v.confidence * 100];
+        } else if (v.judged) {
+            if (idle && v.confidence >= kMinConfidence) { stop = YES; why = [NSString stringWithFormat:@"quiet %@, no evidence to keep it: %@", quiet, v.reason]; }
+            else why = idle ? [NSString stringWithFormat:@"the judge was not sure (%.0f%%)", v.confidence * 100]
+                            : [NSString stringWithFormat:@"evidence: %@", v.keepEvidence.length ? v.keepEvidence : v.reason];
+        } else if (idle && v.confidence >= kSureConfidence) {
+            stop = YES; why = [NSString stringWithFormat:@"quiet %@: %@", quiet, v.reason];
+        } else if (v.keepEvidence.length) {
+            why = [@"evidence: " stringByAppendingString:v.keepEvidence];
+        } else if (r.judgeError && idle && v.confidence >= kMinConfidence) {
+            stop = YES; why = [NSString stringWithFormat:@"quiet %@: %@ (the judge failed)", quiet, v.reason];
+        } else {
+            why = r.judgeError ? [@"the judge failed: " stringByAppendingString:r.judgeError] : @"not judged yet";
+        }
+        [plan addObject:@{@"host": h, @"stop": @(stop), @"why": why}];
+    }
+    return plan;
+}
+
+/// The hosts the Eager judge looks at: quiet, free to decide, and not already clearly idle or judged.
+static NSArray<LHHost *> *JudgeSubjects(NSArray<LHHost *> *hosts, LHReview *r, BOOL wait) {
+    NSMutableArray *j = [NSMutableArray new];
+    for (LHHost *h in hosts) {
+        if (MustKeep(h, r, LHModeEager, wait)) continue;
+        LHVerdict *v = r.verdicts[h.key];
+        if (v.judged || ([v.verdict isEqualToString:@"idle"] && v.confidence >= kSureConfidence)) continue;
+        [j addObject:h];
+    }
+    return j;
+}
+
+/// A full review: the first pass, then in Eager mode the judge for the hosts that need one. Blocks.
+static LHReview *RunReview(NSArray<LHHost *> *hosts, LHScanner *s, NSString *model, LHMode mode, NSString *trigger) {
+    LHReview *r = [LHReviewer review:hosts scanner:s model:model];
+    r.mode = ModeNames()[mode]; r.trigger = trigger;
+    if (!r.error && mode == LHModeEager) [LHReviewer judge:JudgeSubjects(hosts, r, YES) review:r scanner:s model:model];
+    return r;
 }
 
 static NSString *StateMark(LHHost *h, LHReview *r) {
@@ -155,28 +259,48 @@ static void SetClosed(NSArray *all) {
     [[NSJSONSerialization dataWithJSONObject:all ?: @[] options:NSJSONWritingPrettyPrinted error:nil] writeToFile:ClosedPath() atomically:YES];
 }
 
-static void RememberClosed(NSArray<LHHost *> *hosts) {
+/// by names who stopped it: nil for the user, or the mode. why is the reason per host key.
+static void RememberClosed(NSArray<LHHost *> *hosts, NSString *by, NSDictionary<NSString *, NSString *> *why) {
     NSMutableArray *all = [Closed() mutableCopy];
     for (LHHost *h in hosts)
         [all insertObject:@{@"at": @(NSDate.date.timeIntervalSince1970), @"port": @(h.port), @"project": h.project,
-                            @"framework": h.framework, @"restart": h.restartCommand} atIndex:0];
+                            @"framework": h.framework, @"restart": h.restartCommand, @"by": by ?: @"you", @"why": why[h.key] ?: @""} atIndex:0];
     while (all.count > 20) [all removeLastObject];
     SetClosed(all);
 }
 
 /// SIGTERM and a grace period. Returns the hosts that are still running.
-static NSArray<LHHost *> *StopHosts(NSArray<LHHost *> *hosts, NSTimeInterval grace) {
+static NSArray<LHHost *> *StopHostsBy(NSArray<LHHost *> *hosts, NSTimeInterval grace, NSString *by, NSDictionary *why) {
     NSMutableArray *live = [NSMutableArray new];
     for (LHHost *h in hosts) if ([LHScanner alive:h]) [live addObject:h];   // never signal a reused pid
-    RememberClosed(live);
+    RememberClosed(live, by, why);
     for (LHHost *h in live) for (NSNumber *p in Targets(h)) kill(p.intValue, SIGTERM);
     return StillRunning(live, grace);
 }
+
+static NSArray<LHHost *> *StopHosts(NSArray<LHHost *> *hosts, NSTimeInterval grace) { return StopHostsBy(hosts, grace, nil, nil); }
 
 /// SIGKILL. Whatever the server had in memory is lost.
 static NSArray<LHHost *> *KillHosts(NSArray<LHHost *> *hosts) {
     for (LHHost *h in hosts) if ([LHScanner alive:h]) for (NSNumber *p in Targets(h)) kill(p.intValue, SIGKILL);
     return StillRunning(hosts, 2);
+}
+
+/// Carries out the mode's plan on freshly sampled hosts. SIGTERM first; SIGKILL only when the user's setting is
+/// Force Stop It or force is set. Never asks: a server that ignores SIGTERM is left running and said so.
+/// Returns what was done, for review.json and the notification.
+static NSArray<NSDictionary *> *AutoStop(NSArray<LHHost *> *hosts, LHReview *r, LHMode mode, BOOL wait, BOOL force) {
+    if (mode == LHModeIdle) return @[];
+    NSMutableArray *targets = [NSMutableArray new]; NSMutableDictionary *why = [NSMutableDictionary new];
+    for (NSDictionary *p in Plan(hosts, r, mode, wait)) if ([p[@"stop"] boolValue]) { [targets addObject:p[@"host"]]; why[[p[@"host"] key]] = p[@"why"]; }
+    if (!targets.count) return @[];
+    NSArray *left = StopHostsBy(targets, kGrace, ModeLabel(mode), why);
+    if (left.count && (force || ForceMode() == LHForceAlways)) left = KillHosts(left);
+    NSMutableArray *actions = [NSMutableArray new];
+    for (LHHost *h in targets)
+        [actions addObject:@{@"port": @(h.port), @"project": h.project, @"framework": h.framework, @"memoryBytes": @(h.memory),
+                             @"why": why[h.key], @"stopped": @(![left containsObject:h]), @"at": @(NSDate.date.timeIntervalSince1970)}];
+    return actions;
 }
 
 #pragma mark - CLI
@@ -187,6 +311,19 @@ static void PrintJSON(id obj) {
 }
 
 static NSString *Cut(NSString *s, NSUInteger n) { return s.length > n ? [[s substringToIndex:n - 1] stringByAppendingString:@"…"] : (s ?: @""); }
+
+/// Lines of at most n characters, broken at spaces, for text shown as menu headers.
+static NSArray<NSString *> *Wrap(NSString *s, NSUInteger n) {
+    NSMutableArray *lines = [NSMutableArray new]; NSMutableString *line = [NSMutableString new];
+    for (NSString *w in [s componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]) {
+        if (!w.length) continue;
+        if (line.length && line.length + 1 + w.length > n) { [lines addObject:[line copy]]; [line setString:@""]; }
+        if (line.length) [line appendString:@" "];
+        [line appendString:w];
+    }
+    if (line.length) [lines addObject:line];
+    return lines;
+}
 
 static void PrintHosts(NSArray<LHHost *> *hosts, LHReview *r) {
     printf("%-3s%-7s%-16s%-38s%-9s%6s %9s  %-26s%s\n", "", "port", "what", "project", "up", "cpu", "memory", "state", "started by");
@@ -244,7 +381,10 @@ static int Usage(void) {
         "  free [port]           the first free port at or above port (default 3000)\n"
         "  explain <port>        what it is, how it runs, why it is there and what it wastes, with every fact found\n"
         "  waste                 what each server burned since it was last used, and duplicates\n"
-        "  review                ask the model which localhosts are in use; saves the verdicts\n"
+        "  review                ask the model which localhosts are in use; in Eager mode the judge looks again\n"
+        "  summary               what is going on, in the model's words, and what the mode would do\n"
+        "  auto                  one round of the mode: stop what it decides to stop (--dry-run shows it, --review reviews first)\n"
+        "  mode [name]           show or set the mode: idle (report only), proactive (obvious waste), eager (default)\n"
         "  idle                  what Close Idle would stop right now\n"
         "  close <port|pid>      stop one server: SIGTERM, then SIGKILL with --force\n"
         "  close-idle            stop every confirmed idle server\n"
@@ -259,7 +399,9 @@ static int Usage(void) {
         "  --http                ready: also wait for an HTTP answer below 500\n"
         "  --model <alias>       review: auto (Haiku, then Luna), haiku, sonnet, opus, luna or a full model name (setting: locohost.model)\n"
         "  --review              close-idle: run a review first\n"
-        "  --port <port>         close-idle: only this port\n");
+        "  --port <port>         close-idle: only this port\n"
+        "  --mode <name>         review, summary, auto: use this mode instead of the setting\n"
+        "  --dry-run             auto: show the plan, stop nothing\n");
     return 2;
 }
 
@@ -300,11 +442,23 @@ static int RunCLI(int argc, const char **argv) {
     NSString *arg1 = args.count > 1 && ![args[1] hasPrefix:@"--"] ? args[1] : nil;
 
     if ([cmd isEqualToString:@"rules"]) { printf("%s\n", LHRules.shared.fileURL.path.UTF8String); return 0; }
+    if ([cmd isEqualToString:@"mode"]) {
+        if (arg1) {
+            if (ModeFrom(arg1) < 0) return Usage();
+            PrefSet(kModeKey, ModeNames()[ModeFrom(arg1)]);
+        }
+        printf("%s\n", ModeNames()[Mode()].UTF8String);
+        return 0;
+    }
+    NSInteger modeOpt = opt(@"--mode") ? ModeFrom(opt(@"--mode")) : Mode();
+    if (modeOpt < 0) return Usage();
+    LHMode mode = (LHMode)modeOpt;
     if ([cmd isEqualToString:@"stopped"]) {
         if (json) { PrintJSON(Closed()); return 0; }
         for (NSDictionary *c in Closed())
-            printf(":%-6s %-14s %s ago\n        %s\n", [c[@"port"] description].UTF8String, [c[@"framework"] UTF8String],
-                   LHDuration(NSDate.date.timeIntervalSince1970 - [c[@"at"] doubleValue]).UTF8String, [c[@"restart"] UTF8String]);
+            printf(":%-6s %-14s %s ago by %s%s\n        %s\n", [c[@"port"] description].UTF8String, [c[@"framework"] UTF8String],
+                   LHDuration(NSDate.date.timeIntervalSince1970 - [c[@"at"] doubleValue]).UTF8String, [c[@"by"] ?: @"you" UTF8String],
+                   [c[@"why"] length] ? [NSString stringWithFormat:@": %@", c[@"why"]].UTF8String : "", [c[@"restart"] UTF8String]);
         return 0;
     }
     if ([cmd isEqualToString:@"free"]) {
@@ -335,12 +489,12 @@ static int RunCLI(int argc, const char **argv) {
         [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:[NSString stringWithFormat:@"http://localhost:%@", arg1]]];
         return 0;
     }
-    if (![@[@"list", @"who", @"explain", @"waste", @"review", @"idle", @"close", @"close-idle"] containsObject:cmd]) return Usage();
+    if (![@[@"list", @"who", @"explain", @"waste", @"review", @"summary", @"auto", @"idle", @"close", @"close-idle"] containsObject:cmd]) return Usage();
 
     LHScanner *s = [LHScanner new];
     s.idleSeconds = IdleMinutes() * 60;
     [s sample]; [NSThread sleepForTimeInterval:1.0]; [s sample];   // two samples for CPU%
-    if (PrefBool(kProbeKey, YES) && ![cmd hasPrefix:@"close"]) {
+    if (PrefBool(kProbeKey, YES) && ![cmd hasPrefix:@"close"] && ![cmd isEqualToString:@"auto"]) {
         __block BOOL done = NO;
         [s probeHosts:^{ done = YES; }];
         NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:4];
@@ -354,7 +508,9 @@ static int RunCLI(int argc, const char **argv) {
             NSMutableArray *o = [NSMutableArray new], *ig = [NSMutableArray new];
             for (LHHost *h in s.hosts) [o addObject:HostJSON(h, review)];
             for (LHIgnored *i in s.ignored) [ig addObject:@{@"pid": @(i.pid), @"name": i.name, @"ports": i.ports}];
-            PrintJSON(@{@"hosts": o, @"ignored": ig, @"idleMinutes": @(IdleMinutes()),
+            NSMutableArray *plan = [NSMutableArray new];
+            for (NSDictionary *p in Plan(s.hosts, review, mode, YES)) [plan addObject:@{@"key": ((LHHost *)p[@"host"]).key, @"port": @(((LHHost *)p[@"host"]).port), @"stop": p[@"stop"], @"why": p[@"why"]}];
+            PrintJSON(@{@"hosts": o, @"ignored": ig, @"idleMinutes": @(IdleMinutes()), @"mode": ModeNames()[mode], @"plan": plan,
                         @"watchingSince": @(s.watchingSince.timeIntervalSince1970), @"candidates": [Candidates(s.hosts, review) valueForKey:@"key"]});
             return 0;
         }
@@ -482,13 +638,14 @@ static int RunCLI(int argc, const char **argv) {
         return 0;
     }
 
-    if ([cmd isEqualToString:@"review"] || ([cmd isEqualToString:@"close-idle"] && [args containsObject:@"--review"])) {
+    if ([cmd isEqualToString:@"review"] || ([@[@"close-idle", @"auto"] containsObject:cmd] && [args containsObject:@"--review"])) {
         NSString *model = opt(@"--model") ?: Model();
         if (!json) { fprintf(stderr, "reviewing %s with %s…\n", Plural(s.hosts.count, @"localhost").UTF8String, LHModelLabel(model).UTF8String); }
-        review = [LHReviewer review:s.hosts scanner:s model:model];
+        review = RunReview(s.hosts, s, model, mode, @"manual");
         [review save];
         if (review.error) { fprintf(stderr, "review failed: %s\n", review.error.UTF8String); return 1; }
         if (review.note && !json) fprintf(stderr, "%s, so %s answered\n", review.note.UTF8String, LHModelLabel(review.model).UTF8String);
+        if (review.judgeError && !json) fprintf(stderr, "the Eager judge failed: %s\n", review.judgeError.UTF8String);
         if ([cmd isEqualToString:@"review"]) {
             if (json) {
                 NSMutableArray *o = [NSMutableArray new];
@@ -504,8 +661,41 @@ static int RunCLI(int argc, const char **argv) {
             }
             printf("\n%s in %.0fs · %s · %ld confirmed idle now\n", LHModelLabel(review.model).UTF8String, review.seconds, Tokens(review.tokens).UTF8String,
                    (long)Candidates(s.hosts, review).count);
+            if (review.summary.length) printf("\n%s\n", review.summary.UTF8String);
             return 0;
         }
+    }
+
+    if ([cmd isEqualToString:@"summary"] || [cmd isEqualToString:@"auto"]) {
+        BOOL dry = [cmd isEqualToString:@"summary"] || [args containsObject:@"--dry-run"];
+        NSArray<LHHost *> *scope = s.hosts;
+        if (opt(@"--port")) scope = [scope filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(LHHost *h, id _) { return [h.ports containsObject:@(opt(@"--port").integerValue)]; }]];
+        NSArray *plan = Plan(scope, review, mode, YES);
+        NSArray *actions = dry ? @[] : AutoStop(scope, review, mode, YES, force);
+        if (!dry && review && actions.count) { review.actions = actions; [review save]; }
+        if (json) {
+            NSMutableArray *o = [NSMutableArray new];
+            for (NSDictionary *p in plan) [o addObject:@{@"key": ((LHHost *)p[@"host"]).key, @"port": @(((LHHost *)p[@"host"]).port), @"project": ((LHHost *)p[@"host"]).project, @"stop": p[@"stop"], @"why": p[@"why"]}];
+            PrintJSON(@{@"mode": ModeNames()[mode], @"summary": review.summary ?: NSNull.null, @"plan": o, @"actions": actions,
+                        @"reviewAt": review ? @(review.at.timeIntervalSince1970) : NSNull.null, @"trigger": review.trigger ?: NSNull.null});
+            return 0;
+        }
+        if ([cmd isEqualToString:@"summary"]) {
+            if (review.summary.length) printf("%s\n\n", review.summary.UTF8String);
+            else printf("no summary yet: run `locohost review`\n\n");
+            if (review) printf("review %s ago by %s%s\n", LHDuration(-review.at.timeIntervalSinceNow).UTF8String, LHModelLabel(review.model).UTF8String,
+                               review.trigger ? [NSString stringWithFormat:@", woken by %@", review.trigger].UTF8String : "");
+        }
+        printf("%s mode%s:\n", ModeLabel(mode).UTF8String, dry && [cmd isEqualToString:@"auto"] ? ", dry run" : "");
+        for (NSDictionary *p in plan) {
+            LHHost *h = p[@"host"];
+            printf("  %-5s :%-6ld %-14s %-36s %s\n", [p[@"stop"] boolValue] ? "stop" : "keep", (long)h.port, Cut(h.framework, 14).UTF8String,
+                   Cut(h.project, 36).UTF8String, [p[@"why"] UTF8String]);
+        }
+        if (!plan.count) printf("  no dev servers running\n");
+        for (NSDictionary *a in actions)
+            printf("%s :%s %s\n", [a[@"stopped"] boolValue] ? "stopped" : "still running (ignored SIGTERM)", [a[@"port"] description].UTF8String, [a[@"project"] UTF8String]);
+        return 0;
     }
 
     if ([cmd isEqualToString:@"idle"] || [cmd isEqualToString:@"close-idle"]) {
@@ -549,6 +739,15 @@ static int RunCLI(int argc, const char **argv) {
 @property (strong) NSTimer *timer;
 @property BOOL reviewing;
 @property NSInteger ticks;
+// What wakes a review besides the schedule: a new server, a long uptime, memory pressure, sustained load.
+@property (strong) NSMutableSet<NSString *> *known;                        // host keys seen, so a new one stands out
+@property (strong) NSMutableDictionary<NSString *, NSNumber *> *ageMark;   // per host: how many uptime marks it has passed
+@property (copy) NSString *pending;                                          // the event waiting to wake a review
+@property (strong) NSDate *lastEvent;                                        // when an event last woke one
+@property NSInteger loadTicks;                                               // samples in a row with load above the core count
+@property BOOL learned;                                                      // the servers running at launch are known
+@property (strong) dispatch_source_t pressure;
+@property (strong) NSDictionary<NSString *, NSDictionary *> *plan;   // by host key, built when the menu opens
 @end
 
 @implementation LocoHost
@@ -561,9 +760,44 @@ static int RunCLI(int argc, const char **argv) {
     self.statusItem.button.action = @selector(handleClick:);
     self.statusItem.button.imagePosition = NSImageLeft;
     [self.statusItem.button sendActionOn:NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp];
+    self.known = [NSMutableSet new]; self.ageMark = [NSMutableDictionary new];
+    self.pressure = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0, DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL, dispatch_get_main_queue());
+    dispatch_source_set_event_handler(self.pressure, ^{
+        self.pending = dispatch_source_get_data(self.pressure) & DISPATCH_MEMORYPRESSURE_CRITICAL ? @"critical memory pressure" : @"memory pressure";
+    });
+    dispatch_resume(self.pressure);
+    [UNUserNotificationCenter.currentNotificationCenter requestAuthorizationWithOptions:UNAuthorizationOptionAlert completionHandler:^(BOOL ok, NSError *e) {}];
     self.timer = [NSTimer scheduledTimerWithTimeInterval:5 target:self selector:@selector(tick) userInfo:nil repeats:YES];
     self.timer.tolerance = 1;
     [self tick];
+}
+
+/// Notes the events that should wake a review: a dev server that has run for two minutes and was not there before,
+/// one that passes a day, three days or a week of uptime, and load above the core count for half a minute.
+/// The first sample only learns what is already running.
+- (void)watchEvents {
+    BOOL first = !self.learned;
+    self.learned = YES;
+    static const double marks[] = {86400, 3 * 86400, 7 * 86400};
+    for (LHHost *h in self.scanner.hosts) {
+        if (![h.kind isEqualToString:@"dev"]) continue;
+        double up = -h.started.timeIntervalSinceNow;
+        NSInteger passed = 0; while (passed < 3 && up >= marks[passed]) passed++;
+        if (![self.known containsObject:h.key]) {
+            if (first || up >= 120) {
+                [self.known addObject:h.key]; self.ageMark[h.key] = @(passed);
+                if (!first) self.pending = [NSString stringWithFormat:@"new server :%ld %@", (long)h.port, h.framework];
+            }
+            continue;
+        }
+        if (passed > [self.ageMark[h.key] integerValue]) {
+            self.ageMark[h.key] = @(passed);
+            self.pending = [NSString stringWithFormat:@":%ld up %@", (long)h.port, LHDuration(marks[passed - 1])];
+        }
+    }
+    double load[1] = {0};
+    if (getloadavg(load, 1) == 1 && load[0] > NSProcessInfo.processInfo.activeProcessorCount) self.loadTicks++; else self.loadTicks = 0;
+    if (self.loadTicks == 6) self.pending = [NSString stringWithFormat:@"high load %.1f", load[0]];
 }
 
 - (void)tick {
@@ -571,9 +805,15 @@ static int RunCLI(int argc, const char **argv) {
     [self.scanner sample];
     for (LHHost *h in self.scanner.hosts) LHIntel(h, NO);   // reads project, git and sessions in the background, five-minute cache
     if (self.ticks++ % 6 == 0 && PrefBool(kProbeKey, YES)) [self.scanner probeHosts:nil];   // every 30 s, each host at most every 5 min
+    [self watchEvents];
     NSInteger every = PrefInt(kReviewMinKey, 60);
-    if (every > 0 && !self.reviewing && self.scanner.hosts.count &&
-        (!self.review || -self.review.at.timeIntervalSinceNow >= every * 60)) [self reviewNow];
+    BOOL hosts = self.scanner.hosts.count > 0;
+    if (every > 0 && !self.reviewing && hosts && (!self.review || -self.review.at.timeIntervalSinceNow >= every * 60))
+        [self reviewBecause:@"schedule"];
+    else if (every > 0 && self.pending && !self.reviewing && hosts && (!self.lastEvent || -self.lastEvent.timeIntervalSinceNow >= kEventGap)) {
+        self.lastEvent = NSDate.date;
+        [self reviewBecause:self.pending];
+    }
     [self updateButton];
 }
 
@@ -592,18 +832,38 @@ static int RunCLI(int argc, const char **argv) {
 
 #pragma mark Review
 
-- (void)reviewNow {
+- (void)reviewNow { [self reviewBecause:@"manual"]; }
+
+/// Reviews in the background, then lets the mode act on fresh samples.
+- (void)reviewBecause:(NSString *)trigger {
     if (self.reviewing) return;
-    self.reviewing = YES;
-    NSArray *hosts = self.scanner.hosts; LHScanner *s = self.scanner; NSString *model = Model();
+    self.reviewing = YES; self.pending = nil;
+    NSArray *hosts = self.scanner.hosts; LHScanner *s = self.scanner; NSString *model = Model(); LHMode mode = Mode();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        LHReview *r = [LHReviewer review:hosts scanner:s model:model];
+        LHReview *r = RunReview(hosts, s, model, mode, trigger);
         dispatch_async(dispatch_get_main_queue(), ^{
-            [r save];
             self.review = r; self.reviewing = NO;
+            [self.scanner sample];   // re-check right before acting
+            r.actions = AutoStop(self.scanner.hosts, r, mode, NO, NO);
+            [r save];
+            [self notify:r.actions mode:mode];
             [self updateButton];
         });
     });
+}
+
+- (void)notify:(NSArray<NSDictionary *> *)actions mode:(LHMode)mode {
+    if (!actions.count) return;
+    uint64_t mem = 0; NSMutableArray *lines = [NSMutableArray new];
+    for (NSDictionary *a in actions) {
+        if ([a[@"stopped"] boolValue]) mem += [a[@"memoryBytes"] unsignedLongLongValue];
+        [lines addObject:[NSString stringWithFormat:@":%@ %@%@", a[@"port"], a[@"project"], [a[@"stopped"] boolValue] ? @"" : @" (still running)"]];
+    }
+    UNMutableNotificationContent *c = [UNMutableNotificationContent new];
+    c.title = [NSString stringWithFormat:@"%@ stopped %@, %@ freed", ModeLabel(mode), Plural(actions.count, @"server"), LHFormatBytes(mem)];
+    c.body = [[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\nRecently Stopped keeps each restart command."];
+    [UNUserNotificationCenter.currentNotificationCenter addNotificationRequest:[UNNotificationRequest requestWithIdentifier:NSUUID.UUID.UUIDString content:c trigger:nil]
+                                                         withCompletionHandler:nil];
 }
 
 #pragma mark Menu
@@ -647,6 +907,11 @@ static NSMenuItem *Sub(NSMenu *m, NSString *t, NSMenu *sub) { NSMenuItem *i = It
     Header(m, [@"Waste: " stringByAppendingString:Cut(waste, 100)]).toolTip = waste;
     if (h.duplicates.count) Header(m, [NSString stringWithFormat:@"Duplicate: same folder and branch as :%@", [[h.duplicates valueForKey:@"stringValue"] componentsJoinedByString:@", :"]]);
     if (v.recommendation.length) Header(m, [@"Advice: " stringByAppendingString:Cut(v.recommendation, 100)]).toolTip = v.recommendation;
+    NSDictionary *p = self.plan[h.key];
+    if (p) {
+        NSString *line = [NSString stringWithFormat:@"%@: %@, %@", ModeLabel(Mode()), [p[@"stop"] boolValue] ? @"stop" : @"keep", p[@"why"]];
+        Header(m, Cut(line, 110)).toolTip = line;
+    }
     if (GitWords(intel[@"git"], h)) Header(m, [@"Git: " stringByAppendingString:Cut(GitWords(intel[@"git"], h), 100)]).toolTip = GitWords(intel[@"git"], h);
     [m addItem:NSMenuItem.separatorItem];
     if (h.title.length) Header(m, [NSString stringWithFormat:@"Page: %@ (HTTP %ld)", h.title, (long)h.httpStatus]);
@@ -691,6 +956,10 @@ static NSMenuItem *Sub(NSMenu *m, NSString *t, NSMenu *sub) { NSMenuItem *i = It
     for (LHHost *h in hosts) { mem += h.memory; cpu += h.cpuPercent; }
     for (LHHost *h in idle) idleMem += h.memory;
 
+    NSMutableDictionary *plan = [NSMutableDictionary new];
+    for (NSDictionary *p in Plan(hosts, r, Mode(), NO)) plan[[p[@"host"] key]] = p;
+    self.plan = plan;
+
     NSMenu *menu = [NSMenu new];
     Header(menu, [NSString stringWithFormat:@"%@ · %lu in use · %lu quiet · %@ CPU · %@", Plural(devs.count + services.count, @"localhost"),
                   (unsigned long)inUse.count, (unsigned long)quiet.count, Pct(cpu), LHFormatBytes(mem)]);
@@ -713,8 +982,16 @@ static NSMenuItem *Sub(NSMenu *m, NSString *t, NSMenu *sub) { NSMenuItem *i = It
     rv.enabled = !self.reviewing && hosts.count;
     rv.image = [NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:nil];
     if (r) Header(menu, r.error ? [NSString stringWithFormat:@"   Last review failed: %@", Cut(r.error, 70)]
-                              : [NSString stringWithFormat:@"   Last review %@ ago by %@ · %@ · %@ · %.0fs", LHDuration(-r.at.timeIntervalSinceNow),
-                                 LHModelLabel(r.model), Plural(r.hostCount, @"host"), Tokens(r.tokens), r.seconds]).toolTip = r.error ?: r.note;
+                              : [NSString stringWithFormat:@"   Last review %@ ago by %@%@ · %@ · %@ · %.0fs", LHDuration(-r.at.timeIntervalSinceNow),
+                                 LHModelLabel(r.model), r.trigger && ![r.trigger isEqualToString:@"manual"] ? [@", woken by " stringByAppendingString:r.trigger] : @"",
+                                 Plural(r.hostCount, @"host"), Tokens(r.tokens), r.seconds]).toolTip = r.error ?: r.note;
+    if (r.summary.length) for (NSString *line in Wrap(r.summary, 78)) Header(menu, [@"   " stringByAppendingString:line]);
+    if (r.actions.count) {
+        NSMutableArray *ports = [NSMutableArray new];
+        for (NSDictionary *a in r.actions) [ports addObject:[NSString stringWithFormat:@":%@%@", a[@"port"], [a[@"stopped"] boolValue] ? @"" : @" (still running)"]];
+        Header(menu, [NSString stringWithFormat:@"   %@ stopped %@ after it: %@", [r.mode capitalizedString] ?: @"The mode", Plural(r.actions.count, @"server"),
+                      [ports componentsJoinedByString:@", "]]);
+    }
     [menu addItem:NSMenuItem.separatorItem];
 
     if (!hosts.count) Header(menu, @"No localhosts running");
@@ -739,14 +1016,30 @@ static NSMenuItem *Sub(NSMenu *m, NSString *t, NSMenu *sub) { NSMenuItem *i = It
         NSMenu *cm = [NSMenu new];
         Header(cm, @"Pick one to copy its restart command");
         for (NSDictionary *c in closed)
-            Item(cm, [NSString stringWithFormat:@":%@  %@  %@   %@ ago", c[@"port"], c[@"framework"], c[@"project"],
-                      LHDuration(NSDate.date.timeIntervalSince1970 - [c[@"at"] doubleValue])], @selector(copyClosed:), self, NO).representedObject = c[@"restart"];
+        {
+            NSMenuItem *ci = Item(cm, [NSString stringWithFormat:@":%@  %@  %@   %@ ago by %@", c[@"port"], c[@"framework"], c[@"project"],
+                                       LHDuration(NSDate.date.timeIntervalSince1970 - [c[@"at"] doubleValue]), c[@"by"] ?: @"you"], @selector(copyClosed:), self, NO);
+            ci.representedObject = c[@"restart"]; ci.toolTip = [c[@"why"] length] ? c[@"why"] : nil;
+        }
         [cm addItem:NSMenuItem.separatorItem];
         Item(cm, @"Clear", @selector(clearClosed), self, NO);
         Sub(menu, [NSString stringWithFormat:@"Recently stopped (%lu)", (unsigned long)closed.count], cm);
     }
     [menu addItem:NSMenuItem.separatorItem];
 
+    NSMenu *modes = [NSMenu new];
+    NSArray *modeHelp = @[@"Reviews and reports. Stops nothing by itself.",
+                          @"Stops obvious waste: quiet 6 hours, no agent, the review sure it is idle.",
+                          @"Stops every quiet server that can't show evidence someone needs it."];
+    for (LHMode m = LHModeIdle; m <= LHModeEager; m++) {
+        NSMenuItem *mi = Item(modes, ModeLabel(m), @selector(setMode:), self, Mode() == m);
+        mi.tag = m; mi.toolTip = modeHelp[m];
+    }
+    [modes addItem:NSMenuItem.separatorItem];
+    for (NSString *t in modeHelp) Header(modes, [NSString stringWithFormat:@"%@: %@", ModeLabel((LHMode)[modeHelp indexOfObject:t]), t]);
+    Header(modes, @"Every mode keeps servers used in the quiet window, started in the");
+    Header(modes, @"last 30 minutes, protected, or with an agent session active in the last hour.");
+    Sub(menu, [NSString stringWithFormat:@"Mode: %@", ModeLabel(Mode())], modes);
     NSMenu *every = [NSMenu new];
     for (NSNumber *m in @[@0, @15, @30, @60, @120, @240])
         Item(every, m.integerValue ? LHDuration(m.integerValue * 60) : @"Off", @selector(setReviewEvery:), self, PrefInt(kReviewMinKey, 60) == m.integerValue).tag = m.integerValue;
@@ -858,7 +1151,7 @@ static NSMenuItem *Sub(NSMenu *m, NSString *t, NSMenu *sub) { NSMenuItem *i = It
     a.buttons.firstObject.hasDestructiveAction = YES;
     [NSApp activateIgnoringOtherApps:YES];
     if ([a runModal] != NSAlertFirstButtonReturn) return;
-    RememberClosed(@[h]); KillHosts(@[h]); [self tick];
+    RememberClosed(@[h], nil, nil); KillHosts(@[h]); [self tick];
 }
 
 static void Copy(NSString *s) { [NSPasteboard.generalPasteboard clearContents]; [NSPasteboard.generalPasteboard setString:s forType:NSPasteboardTypeString]; }
@@ -874,6 +1167,7 @@ static void Copy(NSString *s) { [NSPasteboard.generalPasteboard clearContents]; 
 }
 - (void)setReviewEvery:(NSMenuItem *)i { PrefSet(kReviewMinKey, @(i.tag)); }
 - (void)setModel:(NSMenuItem *)i       { PrefSet(kModelKey, i.representedObject); }
+- (void)setMode:(NSMenuItem *)i        { PrefSet(kModeKey, ModeNames()[i.tag]); }
 - (void)setIdle:(NSMenuItem *)i        { PrefSet(kIdleMinKey, @(i.tag)); [self tick]; }
 - (void)setForce:(NSMenuItem *)i       { PrefSet(kForceKey, @(i.tag)); }
 - (void)toggleAsk                      { PrefSet(kAskKey, @(!PrefBool(kAskKey, YES))); }

@@ -6,6 +6,8 @@
 @property (copy) NSString *verdict;     // in_use | idle | unsure
 @property (copy) NSString *about, *reason;
 @property (copy) NSString *what, *how, *why, *waste, *recommendation;   // one sentence each, from the facts LocoHost gathered
+@property (copy) NSString *keepEvidence;   // the concrete fact that someone still needs it, or empty when there is none
+@property BOOL judged;                     // the Eager judge decided this verdict: idle means stop, in_use means keep
 @property double confidence;
 @end
 
@@ -17,6 +19,11 @@
 @property NSInteger tokens, hostCount;
 @property double seconds, costUSD;       // costUSD is the list price the CLI reports; a subscription is not billed per call
 @property (strong) NSDictionary<NSString *, LHVerdict *> *verdicts;   // by host key
+@property (copy) NSString *summary;      // what is going on across all hosts, in a few sentences
+@property (copy) NSString *trigger;      // what woke the review: schedule, new host, long uptime, memory pressure, high load, manual
+@property (copy) NSString *mode;         // idle | proactive | eager, when the review ran
+@property (copy) NSString *judgeError;   // the Eager judge failed; its hosts fall back to the first verdict
+@property (strong) NSArray<NSDictionary *> *actions;   // what the mode stopped after this review: port, project, framework, why
 + (instancetype)load;                    // nil when there is none
 - (void)save;
 @end
@@ -31,6 +38,9 @@
 + (NSArray<NSDictionary *> *)factsFor:(NSArray<LHHost *> *)hosts scanner:(LHScanner *)scanner;
 /// Blocks until the CLI answers or times out. Call it off the main thread in the app.
 + (LHReview *)review:(NSArray<LHHost *> *)hosts scanner:(LHScanner *)scanner model:(NSString *)model;
+/// Eager mode's second look at quiet hosts. The burden of proof is on the host: the judge keeps it only with a
+/// concrete fact that someone still needs it. Replaces those hosts' verdicts in r with judged ones. Blocks.
++ (void)judge:(NSArray<LHHost *> *)hosts review:(LHReview *)r scanner:(LHScanner *)scanner model:(NSString *)model;
 @end
 
 /// Removes values that look like secrets: key=value pairs with a secret-sounding key, the value after a --token

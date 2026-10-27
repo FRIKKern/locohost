@@ -96,6 +96,35 @@ grep -q "SUPERSECRET123" "$LOCOHOST_TEST_SENT";                    check "the ap
 r=$(LOCOHOST_TEST_CODEX_UNSUPPORTED=gpt-6-luna "$BIN" review --model luna --json | json "j['model']")
                                                                     check "luna moves on from a model the account lacks" gpt-5.6-luna "$r"
 
+echo "== modes (every auto run names the fixture port, so no other server is judged or stopped)"
+export LOCOHOST_IDLE_MINUTES=0 LOCOHOST_MIN_UPTIME_MINUTES=0
+plan() { "$BIN" auto --port "$P" --json "$@" | json "j['plan'][0]['stop'] if j['plan'] else 'none'"; }
+LOCOHOST_TEST_IDLE_PORT=$P "$BIN" review --mode eager >/dev/null
+r=$(json "j['summary']" < "$LOCOHOST_HOME/review.json");          check "the review writes a summary" "Fixture summary: $(json "j['hostCount']" < "$LOCOHOST_HOME/review.json") servers." "$r"
+r=$("$BIN" auto --mode eager --port "$P" --dry-run --json | json "j['plan'][0]['why'].startswith('its agent session was active')")
+                                                                    check "eager keeps a server whose agent session is active" True "$r"
+export CLAUDE_CONFIG_DIR="$LOCOHOST_HOME/no-sessions"   # from here on no session, so the mode decides
+r=$(plan --mode idle);                                             check "idle mode stops nothing" False "$r"
+r=$(plan --mode proactive);                                        check "proactive waits for a long quiet" False "$r"
+r=$(LOCOHOST_PROACTIVE_MINUTES=0 plan --mode proactive);           check "proactive stops sure idle after the wait" True "$r"
+r=$("$BIN" stopped --json | json "j[0]['by']");                    check "stopped records the mode" Proactive "$r"
+check "and the port is free" no "$(listening "$P")"
+
+serve "$P"; "$BIN" ready "$P" --timeout 10 >/dev/null
+LOCOHOST_TEST_UNSURE_PORT=$P LOCOHOST_TEST_KEEP_PORT=$P "$BIN" review --mode eager >/dev/null
+r=$(json "any($P in h['ports'] for h in j['hosts'])" < "$LOCOHOST_HOME/sent.json.judge")
+                                                                    check "eager sends an unsure server to the judge" True "$r"
+r=$(plan --mode eager --dry-run);                                  check "the judge keeps it when it shows evidence" False "$r"
+r=$("$BIN" auto --mode eager --port "$P" --dry-run --json | json "j['plan'][0]['why'].startswith('evidence')")
+                                                                    check "and says what the evidence is" True "$r"
+LOCOHOST_TEST_UNSURE_PORT=$P "$BIN" review --mode eager >/dev/null
+r=$(LOCOHOST_MIN_UPTIME_MINUTES=30 plan --mode eager);             check "eager never stops a server started minutes ago" False "$r"
+r=$(plan --mode eager);                                            check "eager stops it without evidence" True "$r"
+check "and the port is free" no "$(listening "$P")"
+r=$("$BIN" stopped --json | json "j[0]['by']");                    check "stopped records the mode" Eager "$r"
+serve "$P"; "$BIN" ready "$P" --timeout 10 >/dev/null
+unset LOCOHOST_IDLE_MINUTES LOCOHOST_MIN_UPTIME_MINUTES
+
 echo "== a failed review closes nothing"
 LOCOHOST_TEST_CLAUDE_LIMIT=1 LOCOHOST_CODEX=/usr/bin/false "$BIN" review --model auto >/dev/null 2>&1
                                                                     check "both models failing exits 1" 1 "$?"

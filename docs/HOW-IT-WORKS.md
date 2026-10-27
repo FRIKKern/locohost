@@ -39,9 +39,34 @@ The history lives in `activity.json`, so a restart of LocoHost does not reset it
 | ○ | Quiet for the threshold or longer. |
 | ◇ | Quiet, and the latest review agrees it is idle. |
 
+## When the review runs
+
+On a schedule, hourly by default, set under *Review Every*. With the app running, these events also wake a review, at most once every ten minutes:
+
+- A dev server LocoHost has not seen before, once it has run for two minutes. Servers that were running when LocoHost started do not count.
+- A dev server that passes a day, three days or a week of uptime.
+- Memory pressure reported by macOS, warning or critical.
+- A one-minute load average above the number of cores for six samples in a row, half a minute.
+
+The review records what woke it. The menu shows it next to the last review, as "woken by new server :3317 Vite".
+
+## Modes
+
+After each review the mode decides what to stop. *Mode* in the menu, or `locohost mode <name>`, sets it.
+
+Every mode keeps a dev server when any of these holds: it is protected, it was used within the quiet threshold, it started less than 30 minutes ago, there is no review from the last three hours without an error, it was used after the review, or the agent session that started it was active in the last hour.
+
+- **Idle** stops nothing. It reviews, summarizes and shows what Close Idle would stop.
+- **Proactive** also keeps a server with a live agent process above it. It stops a server quiet for six hours that the review calls idle with at least 80% confidence.
+- **Eager** stops a server the review calls idle with at least 80% confidence. Every other quiet server goes to the judge, a second model pass with the burden of proof on the server. The judge keeps a server only when it names a concrete fact that someone still needs it, and stops it otherwise with at least 60% confidence. If the judge fails, Eager stops only what the first pass called idle with at least 60% confidence.
+
+Before stopping, LocoHost samples again, so a server used during the review stays. A mode sends SIGTERM and never asks. A server that ignores it stays running, unless *When a Server Won't Stop* is set to Force Stop It. A notification lists what was stopped. *Recently Stopped* and `locohost stopped` show who stopped each server and why.
+
+`locohost summary` and `locohost auto --dry-run` show what the mode would do without stopping anything.
+
 ## Close Idle
 
-A server is stopped by Close Idle only when all of these hold:
+Close Idle is the manual button, and it works in every mode. A server is stopped by Close Idle only when all of these hold:
 
 1. It is a dev server, not a service such as Postgres, Redis or epmd.
 2. It is not protected by name, port or folder in `rules.json`.

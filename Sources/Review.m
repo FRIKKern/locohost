@@ -38,10 +38,14 @@ static NSString *ReviewPath(void) { return [LHSupportDir() stringByAppendingPath
         LHVerdict *x = [LHVerdict new];
         x.verdict = hosts[k][@"verdict"]; x.about = hosts[k][@"about"]; x.reason = hosts[k][@"reason"];
         x.what = hosts[k][@"what"]; x.how = hosts[k][@"how"]; x.why = hosts[k][@"why"]; x.waste = hosts[k][@"waste"]; x.recommendation = hosts[k][@"recommendation"];
+        x.keepEvidence = hosts[k][@"keep_evidence"]; x.judged = [hosts[k][@"judged"] boolValue];
         x.confidence = [hosts[k][@"confidence"] doubleValue];
         v[k] = x;
     }
     r.verdicts = v;
+    NSString *(^str)(NSString *) = ^NSString *(NSString *k) { return [j[k] isKindOfClass:NSString.class] ? j[k] : nil; };
+    r.summary = str(@"summary"); r.trigger = str(@"trigger"); r.mode = str(@"mode"); r.judgeError = str(@"judgeError");
+    r.actions = [j[@"actions"] isKindOfClass:NSArray.class] ? j[@"actions"] : @[];
     return r;
 }
 
@@ -50,11 +54,14 @@ static NSString *ReviewPath(void) { return [LHSupportDir() stringByAppendingPath
     for (NSString *k in self.verdicts) {
         LHVerdict *x = self.verdicts[k];
         hosts[k] = @{@"verdict": x.verdict ?: @"unsure", @"about": x.about ?: @"", @"reason": x.reason ?: @"", @"confidence": @(x.confidence),
-                     @"what": x.what ?: @"", @"how": x.how ?: @"", @"why": x.why ?: @"", @"waste": x.waste ?: @"", @"recommendation": x.recommendation ?: @""};
+                     @"what": x.what ?: @"", @"how": x.how ?: @"", @"why": x.why ?: @"", @"waste": x.waste ?: @"", @"recommendation": x.recommendation ?: @"",
+                     @"keep_evidence": x.keepEvidence ?: @"", @"judged": @(x.judged)};
     }
     NSDictionary *j = @{@"at": @(self.at.timeIntervalSince1970), @"model": self.model ?: @"", @"error": self.error ?: NSNull.null, @"note": self.note ?: NSNull.null,
                         @"tokens": @(self.tokens), @"hostCount": @(self.hostCount), @"seconds": @(self.seconds),
-                        @"costUSD": @(self.costUSD), @"hosts": hosts};
+                        @"costUSD": @(self.costUSD), @"hosts": hosts, @"summary": self.summary ?: NSNull.null,
+                        @"trigger": self.trigger ?: NSNull.null, @"mode": self.mode ?: NSNull.null,
+                        @"judgeError": self.judgeError ?: NSNull.null, @"actions": self.actions ?: @[]};
     [NSFileManager.defaultManager createDirectoryAtPath:LHSupportDir() withIntermediateDirectories:YES attributes:nil error:nil];
     [[NSJSONSerialization dataWithJSONObject:j options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil]
         writeToFile:ReviewPath() atomically:YES];
@@ -133,16 +140,22 @@ static NSString *const kSystem =
     @"what (what the project and server are), how (how it runs: command, script, framework, what started it), "
     @"why (why it is running: the agent session's task, or the branch and last commit; say no agent session was found when it is null), "
     @"waste (what it costs while unused, with the numbers), and recommendation (keep, stop or check, and the deciding fact). "
-    @"For services and other listeners keep why, waste and recommendation short.";
+    @"For services and other listeners keep why, waste and recommendation short.\n\n"
+    @"keep_evidence: the one concrete fact showing that someone still needs this server running, such as a new request 4 minutes ago, "
+    @"an agent session active 10 minutes ago in this folder, or another local server connected to it. Leave it empty when there is no such fact. "
+    @"Still running, an open tab with no new requests, or recent commits are not evidence.\n\n"
+    @"summary: three or four plain sentences for the developer about the whole machine: how many servers run and what they are for, "
+    @"which are old and unused, what those cost together in memory, CPU and energy, and which you would stop. Use numbers from the facts.";
 
 static NSString *Schema(void) {
-    NSDictionary *s = @{@"type": @"object", @"additionalProperties": @NO, @"required": @[@"hosts"], @"properties": @{@"hosts": @{@"type": @"array", @"items": @{
+    NSDictionary *s = @{@"type": @"object", @"additionalProperties": @NO, @"required": @[@"hosts", @"summary"], @"properties": @{@"hosts": @{@"type": @"array", @"items": @{
         @"type": @"object", @"additionalProperties": @NO,
-        @"required": @[@"id", @"verdict", @"confidence", @"about", @"reason", @"what", @"how", @"why", @"waste", @"recommendation"],
+        @"required": @[@"id", @"verdict", @"confidence", @"about", @"reason", @"what", @"how", @"why", @"waste", @"recommendation", @"keep_evidence"],
         @"properties": @{@"id": @{@"type": @"string"}, @"verdict": @{@"type": @"string", @"enum": @[@"in_use", @"idle", @"unsure"]},
                          @"confidence": @{@"type": @"number"}, @"about": @{@"type": @"string"}, @"reason": @{@"type": @"string"},
                          @"what": @{@"type": @"string"}, @"how": @{@"type": @"string"}, @"why": @{@"type": @"string"},
-                         @"waste": @{@"type": @"string"}, @"recommendation": @{@"type": @"string"}}}}}};
+                         @"waste": @{@"type": @"string"}, @"recommendation": @{@"type": @"string"}, @"keep_evidence": @{@"type": @"string"}}}},
+        @"summary": @{@"type": @"string"}}};
     return [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:s options:0 error:nil] encoding:NSUTF8StringEncoding];
 }
 
@@ -206,9 +219,9 @@ static NSString *Trimmed(NSData *d, NSUInteger max) {
 }
 
 /// Claude through `claude -p`. Returns the structured answer, or nil with r.error set.
-static NSDictionary *AskClaude(LHReview *r, NSString *claude, NSString *model, NSData *prompt) {
-    NSArray *args = @[@"-p", @"--model", model, @"--output-format", @"json", @"--json-schema", Schema(), @"--tools", @"",
-                      @"--no-session-persistence", @"--strict-mcp-config", @"--setting-sources", @"", @"--system-prompt", kSystem];
+static NSDictionary *AskClaude(LHReview *r, NSString *claude, NSString *model, NSString *system, NSString *schema, NSData *prompt) {
+    NSArray *args = @[@"-p", @"--model", model, @"--output-format", @"json", @"--json-schema", schema, @"--tools", @"",
+                      @"--no-session-persistence", @"--strict-mcp-config", @"--setting-sources", @"", @"--system-prompt", system];
     // The user's own Claude login, never an API key from the environment, and not a nested session of the agent that launched us.
     NSArray *dropped = @[@"ANTHROPIC_API_KEY", @"ANTHROPIC_AUTH_TOKEN", @"CLAUDECODE", @"CLAUDE_CODE_ENTRYPOINT", @"CLAUDE_CODE_SSE_PORT"];
     NSData *out, *err; int status; NSString *e = nil;
@@ -265,17 +278,17 @@ static NSString *CodexMessage(NSString *m) {
 }
 
 /// OpenAI through `codex exec`. Every tool is turned off and the sandbox is read-only, so the model only answers.
-static NSDictionary *AskCodexModel(LHReview *r, NSString *codex, NSString *model, NSData *prompt) {
+static NSDictionary *AskCodexModel(LHReview *r, NSString *codex, NSString *model, NSString *system, NSString *schemaText, NSData *prompt) {
     NSString *dir = LHSupportDir();
     NSString *schema = [dir stringByAppendingPathComponent:@"review-schema.json"], *answer = [dir stringByAppendingPathComponent:@"review-answer.json"];
     [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    [Schema() writeToFile:schema atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [schemaText writeToFile:schema atomically:YES encoding:NSUTF8StringEncoding error:nil];
     [NSFileManager.defaultManager removeItemAtPath:answer error:nil];
     NSMutableArray *args = [@[@"exec", @"--model", model, @"--json", @"--output-schema", schema, @"--output-last-message", answer,
                               @"--sandbox", @"read-only", @"--skip-git-repo-check", @"--ephemeral", @"--ignore-user-config", @"--ignore-rules",
                               @"-c", @"model_reasoning_effort=\"low\"", @"-c", @"web_search=\"disabled\"", @"-c", @"approval_policy=\"never\"",
                               @"-c", @"include_apply_patch_tool=false", @"-c", @"features.multi_agent=false",
-                              @"-c", [@"developer_instructions=" stringByAppendingString:TOMLString(kSystem)]] mutableCopy];
+                              @"-c", [@"developer_instructions=" stringByAppendingString:TOMLString(system)]] mutableCopy];
     for (NSString *f in @[@"shell_tool", @"unified_exec", @"apps", @"plugins", @"browser_use", @"computer_use", @"image_generation",
                           @"multi_agent", @"hooks", @"view_image", @"skill_search", @"tool_suggest", @"goals", @"sleep_tool"])
         [args addObjectsFromArray:@[@"--disable", f]];
@@ -310,15 +323,43 @@ static NSDictionary *AskCodexModel(LHReview *r, NSString *codex, NSString *model
 }
 
 /// "luna" tries each Luna model this account offers, moving on only when the account cannot use that model.
-static NSDictionary *AskCodex(LHReview *r, NSString *codex, NSString *model, NSData *prompt) {
+static NSDictionary *AskCodex(LHReview *r, NSString *codex, NSString *model, NSString *system, NSString *schema, NSData *prompt) {
     NSArray *models = [model isEqualToString:@"luna"] ? LunaModels() : @[model];
     for (NSString *m in models) {
         r.error = nil;
-        NSDictionary *so = AskCodexModel(r, codex, m, prompt);
+        NSDictionary *so = AskCodexModel(r, codex, m, system, schema, prompt);
         if (so) return so;
         if (!([r.error containsString:@"not supported"] || [r.error containsString:@"model_not_found"] || [r.error containsString:@"does not exist"])) return nil;
     }
     return nil;
+}
+
+/// One structured answer from the chosen model. "auto" asks Haiku, then Luna when Haiku can't answer.
+/// Sets r.model to the model that answered, r.note when Haiku was skipped, and r.error when nothing answered.
+static NSDictionary *Ask(LHReview *r, NSString *model, NSString *system, NSString *schema, NSData *prompt) {
+    NSDictionary *so = nil;
+    if ([model isEqualToString:@"auto"]) {
+        // Haiku first. Luna when claude is missing, signed out, out of usage or fails in any other way.
+        NSString *claude = [LHReviewer claudePath], *codex = nil;
+        if (claude) so = AskClaude(r, claude, @"haiku", system, schema, prompt);
+        if (!so) {
+            NSString *why = claude ? r.error : @"claude CLI not found";
+            r.note = [NSString stringWithFormat:@"Haiku: %@", why];
+            r.error = nil; r.tokens = 0; r.costUSD = 0;
+            if ((codex = [LHReviewer codexPath])) so = AskCodex(r, codex, @"luna", system, schema, prompt);
+            else r.error = @"codex CLI not found";
+            if (!so) r.error = [NSString stringWithFormat:@"%@. Luna: %@", r.note, r.error];
+        }
+    } else if (IsCodexModel(model)) {
+        NSString *codex = [LHReviewer codexPath];
+        if (codex) so = AskCodex(r, codex, model, system, schema, prompt);
+        else r.error = @"codex CLI not found. Install Codex and sign in, or set locohost.codexPath.";
+    } else {
+        NSString *claude = [LHReviewer claudePath];
+        if (claude) so = AskClaude(r, claude, model, system, schema, prompt);
+        else r.error = @"claude CLI not found. Install Claude Code and sign in, or set locohost.claudePath.";
+    }
+    return so;
 }
 
 @implementation LHReviewer
@@ -373,28 +414,7 @@ static NSDictionary *AskCodex(LHReview *r, NSString *codex, NSString *model, NSD
                             @"hosts": [self factsFor:hosts scanner:scanner]};
     NSData *prompt = [NSJSONSerialization dataWithJSONObject:input options:NSJSONWritingPrettyPrinted error:nil];
 
-    NSDictionary *so = nil;
-    if ([model isEqualToString:@"auto"]) {
-        // Haiku first. Luna when claude is missing, signed out, out of usage or fails in any other way.
-        NSString *claude = [self claudePath], *codex = nil;
-        if (claude) so = AskClaude(r, claude, @"haiku", prompt);
-        if (!so) {
-            NSString *why = claude ? r.error : @"claude CLI not found";
-            r.note = [NSString stringWithFormat:@"Haiku: %@", why];
-            r.error = nil; r.tokens = 0; r.costUSD = 0;
-            if ((codex = [self codexPath])) so = AskCodex(r, codex, @"luna", prompt);
-            else r.error = @"codex CLI not found";
-            if (!so) r.error = [NSString stringWithFormat:@"%@. Luna: %@", r.note, r.error];
-        }
-    } else if (IsCodexModel(model)) {
-        NSString *codex = [self codexPath];
-        if (codex) so = AskCodex(r, codex, model, prompt);
-        else r.error = @"codex CLI not found. Install Codex and sign in, or set locohost.codexPath.";
-    } else {
-        NSString *claude = [self claudePath];
-        if (claude) so = AskClaude(r, claude, model, prompt);
-        else r.error = @"claude CLI not found. Install Claude Code and sign in, or set locohost.claudePath.";
-    }
+    NSDictionary *so = Ask(r, model, kSystem, Schema(), prompt);
     r.seconds = -r.at.timeIntervalSinceNow;
     if (!so) return r;
 
@@ -410,10 +430,73 @@ static NSDictionary *AskCodex(LHReview *r, NSString *codex, NSString *model, NSD
         vv.about = [x[@"about"] description]; vv.reason = [x[@"reason"] description];
         vv.what = [x[@"what"] description]; vv.how = [x[@"how"] description]; vv.why = [x[@"why"] description];
         vv.waste = [x[@"waste"] description]; vv.recommendation = [x[@"recommendation"] description];
+        vv.keepEvidence = [x[@"keep_evidence"] isKindOfClass:NSString.class] ? x[@"keep_evidence"] : @"";
         v[x[@"id"]] = vv;
     }
     r.verdicts = v;
+    r.summary = [so[@"summary"] isKindOfClass:NSString.class] ? so[@"summary"] : nil;
     return r;
+}
+
+static NSString *const kJudge =
+    @"You are the judge in LocoHost's Eager mode. Each server below runs on a developer's Mac, has been quiet for at least "
+    @"quiet_after_minutes, and a first review was not sure enough to stop it. The burden of proof is on the server: "
+    @"keep it only when a concrete fact shows that someone still needs it running. Otherwise stop it. "
+    @"Stopping is cheap: LocoHost keeps the command that starts it again.\n\n"
+    @"Evidence that counts: a new request or real CPU work recently (minutes_since_activity), an agent_session active in the last hour, "
+    @"the repo touched in the last 30 minutes, a client that is another local server rather than a browser, "
+    @"or a duplicate pair where this one is the active one.\n"
+    @"Not evidence: that it is still running, a browser tab held open with no new requests, a live agent process whose session has been quiet for hours, "
+    @"commits on the branch from hours or days ago, uncommitted files nobody touched for hours, or that the developer might want it someday.\n\n"
+    @"first_review is the first pass, for reference. Weigh the facts, not its verdict. "
+    @"For every host return: id (copied exactly), decision (keep or stop), confidence from 0 to 1, "
+    @"evidence (the deciding fact for keep, empty for stop), and reason (one plain sentence naming the facts). "
+    @"Return exactly one entry for every host id.";
+
+static NSString *JudgeSchema(void) {
+    NSDictionary *s = @{@"type": @"object", @"additionalProperties": @NO, @"required": @[@"hosts"], @"properties": @{@"hosts": @{@"type": @"array", @"items": @{
+        @"type": @"object", @"additionalProperties": @NO, @"required": @[@"id", @"decision", @"confidence", @"evidence", @"reason"],
+        @"properties": @{@"id": @{@"type": @"string"}, @"decision": @{@"type": @"string", @"enum": @[@"keep", @"stop"]},
+                         @"confidence": @{@"type": @"number"}, @"evidence": @{@"type": @"string"}, @"reason": @{@"type": @"string"}}}}}};
+    return [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:s options:0 error:nil] encoding:NSUTF8StringEncoding];
+}
+
++ (void)judge:(NSArray<LHHost *> *)hosts review:(LHReview *)r scanner:(LHScanner *)scanner model:(NSString *)model {
+    if (!hosts.count) return;
+    NSMutableArray *facts = [[self factsFor:hosts scanner:scanner] mutableCopy];
+    for (NSUInteger i = 0; i < facts.count; i++) {
+        LHVerdict *v = r.verdicts[hosts[i].key];
+        NSMutableDictionary *f = [facts[i] mutableCopy];
+        f[@"first_review"] = v ? @{@"verdict": v.verdict ?: @"unsure", @"confidence": @(v.confidence), @"reason": v.reason ?: @"",
+                                   @"keep_evidence": v.keepEvidence ?: @""} : NSNull.null;
+        facts[i] = f;
+    }
+    NSDictionary *input = @{@"now": [NSISO8601DateFormatter stringFromDate:NSDate.date timeZone:NSTimeZone.localTimeZone formatOptions:NSISO8601DateFormatWithInternetDateTime],
+                            @"quiet_after_minutes": @((long)(scanner.idleSeconds / 60)), @"hosts": facts};
+    NSData *prompt = [NSJSONSerialization dataWithJSONObject:input options:NSJSONWritingPrettyPrinted error:nil];
+
+    // A scratch review carries the judge's own model, tokens and error; the totals are added to r.
+    LHReview *j = [LHReview new];
+    NSDate *start = NSDate.date;
+    NSDictionary *so = Ask(j, model, kJudge, JudgeSchema(), prompt);
+    r.tokens += j.tokens; r.costUSD += j.costUSD; r.seconds += -start.timeIntervalSinceNow;
+    NSArray *list = [so[@"hosts"] isKindOfClass:NSArray.class] ? so[@"hosts"] : nil;
+    if (!list) { r.judgeError = j.error ?: @"the answer did not match the schema"; return; }
+    NSSet *keys = [NSSet setWithArray:[hosts valueForKey:@"key"]];
+    NSMutableDictionary *v = [r.verdicts mutableCopy];
+    for (NSDictionary *x in list) {
+        if (![x isKindOfClass:NSDictionary.class] || ![keys containsObject:x[@"id"]] || ![@[@"keep", @"stop"] containsObject:x[@"decision"]]) continue;
+        LHVerdict *old = v[x[@"id"]], *vv = [LHVerdict new];
+        vv.about = old.about; vv.what = old.what; vv.how = old.how; vv.why = old.why; vv.waste = old.waste; vv.recommendation = old.recommendation;
+        BOOL keep = [x[@"decision"] isEqualToString:@"keep"];
+        vv.verdict = keep ? @"in_use" : @"idle";
+        vv.confidence = MAX(0, MIN(1, [x[@"confidence"] doubleValue]));
+        vv.keepEvidence = keep && [x[@"evidence"] isKindOfClass:NSString.class] ? x[@"evidence"] : @"";
+        vv.reason = [x[@"reason"] description];
+        vv.judged = YES;
+        v[x[@"id"]] = vv;
+    }
+    r.verdicts = v;
 }
 
 @end
