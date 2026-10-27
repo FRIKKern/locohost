@@ -1,0 +1,30 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='960' height='300' viewBox='0 0 960 300' role='img' aria-labelledby='t d'>
+<title id='t'>How the review runs</title><desc id='d'>Every hour LocoHost writes down the facts about each server, with secrets in command lines redacted. It asks Haiku through the claude CLI. If Haiku is missing, signed out or out of usage, it asks Luna through the codex CLI. Both run on your own login with no tools and answer in a fixed schema: in use, idle or unsure, with a confidence and a one-sentence reason.</desc>
+<defs><marker id='a' viewBox='0 0 10 10' refX='8' refY='5' markerWidth='7' markerHeight='7' orient='auto'><path d='M0 0L10 5L0 10z' fill='#F2A65A'/></marker>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif;fill:#EDE6F2}.t{font-size:19px;font-weight:700}.s{font-size:14px;fill:#C9BCD6}.c{font-family:'SF Mono',Menlo,Consolas,monospace;font-size:12.5px;fill:#F5C542}</style></defs>
+<rect width='960' height='300' rx='18' fill='#1B1024'/>
+<text x='48' y='58' style='font-size:26px;font-weight:700' fill='#F2A65A'>Haiku first, Luna when Haiku can't answer</text>
+<text x='48' y='86' class='s' style='font-size:16px'>On your own subscription, with no tools. The model reads facts and answers in a fixed schema.</text>
+
+<rect x='48' y='118' width='232' height='148' rx='14' fill='#2A1838' stroke='#4A3358'/>
+<text x='68' y='156' class='t'>Facts</text>
+<text x='68' y='184' class='s'>Ports, project, branch,</text>
+<text x='68' y='204' class='s'>who started it, uptime,</text>
+<text x='68' y='224' class='s'>activity, clients, cost.</text>
+<text x='68' y='250' class='s'>Secrets redacted.</text>
+
+<path d='M284 168h22' stroke='#F2A65A' stroke-width='2' marker-end='url(#a)'/>
+<rect x='314' y='118' width='232' height='62' rx='14' fill='#3B2450' stroke='#F2A65A'/>
+<text x='334' y='148' class='t'>Haiku</text><text x='334' y='170' class='c'>claude -p --tools ""</text>
+<path d='M430 186v14' stroke='#F2A65A' stroke-width='2' stroke-dasharray='4 3' marker-end='url(#a)'/>
+<text x='442' y='198' class='s' style='font-size:12.5px'>if it can't answer</text>
+<rect x='314' y='204' width='232' height='62' rx='14' fill='#2A1838' stroke='#4A3358'/>
+<text x='334' y='230' class='t'>Luna</text><text x='334' y='252' class='c'>codex exec, no tools</text>
+<path d='M550 168h22' stroke='#F2A65A' stroke-width='2' marker-end='url(#a)'/>
+<rect x='580' y='118' width='332' height='148' rx='14' fill='#2A1838' stroke='#4A3358'/>
+<text x='600' y='156' class='t'>One verdict per server</text>
+<text x='600' y='184' class='s'><tspan fill='#F5C542'>in_use</tspan>, <tspan fill='#F5C542'>idle</tspan> or <tspan fill='#F5C542'>unsure</tspan>, with a confidence,</text>
+<text x='600' y='204' class='s'>what the server is and one sentence</text>
+<text x='600' y='224' class='s'>naming the facts that decided it.</text>
+<text x='600' y='250' class='s'>Saved to review.json.</text>
+</svg>

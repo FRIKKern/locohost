@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>LocoHost</string>
+	<key>CFBundleExecutable</key>
+	<string>LocoHost</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>no.guerrilla.locohost</string>
+	<key>CFBundleName</key>
+	<string>LocoHost</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>no.guerrilla.locohost</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>locohost</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>100</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>LocoHost reads the .git folder of each project a localhost runs from, to show its repo, branch and worktree.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>LocoHost reads the .git folder of each project a localhost runs from, to show its repo, branch and worktree.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>LocoHost reads the .git folder of each project a localhost runs from, to show its repo, branch and worktree.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Frikk Jarl</string>
+</dict>
+</plist>

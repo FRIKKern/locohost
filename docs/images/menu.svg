@@ -1,0 +1,37 @@
+<svg xmlns='http://www.w3.org/2000/svg' xml:space='preserve' width='960' height='560' viewBox='0 0 960 560' role='img' aria-labelledby='t d'>
+<title id='t'>The LocoHost menu</title><desc id='d'>A drawing of the LocoHost menu. The top line counts 11 localhosts, 4 in use, 3 quiet, 21% CPU and 9.0 GB. Below it are Close Idle, which will stop 3 servers holding 1.5 GB, and Review Now with Haiku or Luna, last run 12 minutes ago by Haiku. Then come the servers in use, such as Vite on port 3317 in the page-builder worktree, open in headless Chrome. Next are the quiet ones, such as two Phoenix servers up for 12 and 7 days with nobody connected for 3 hours, which the review calls idle. Services such as Postgres are listed apart and never closed.</desc>
+<defs><style>
+text{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',Arial,sans-serif;font-size:15px;fill:#EDE6F2}
+.m{font-family:'SF Mono',Menlo,Consolas,monospace;font-size:13.5px;white-space:pre}
+.h{fill:#9B8DA8;font-size:13px;font-weight:600}
+.dim{fill:#9B8DA8}
+.o{fill:#F2A65A}
+.y{fill:#F5C542}
+</style></defs>
+<rect width='960' height='560' rx='18' fill='#1B1024'/>
+<g transform='translate(640 18)'>
+<rect x='130' y='0' width='160' height='26' rx='6' fill='#2A1838'/>
+<rect x='146' y='6' width='12' height='14' rx='2' fill='none' stroke='#F2A65A' stroke-width='1.6'/><path d='M146 11h12M146 15.5h12' stroke='#F2A65A' stroke-width='1.4'/>
+<text x='166' y='18' class='m'>11 · 3 idle</text>
+</g>
+<rect x='40' y='56' width='880' height='480' rx='12' fill='#2A1838' stroke='#4A3358'/>
+<text x='64' y='88' style='font-weight:600'>11 localhosts · 4 in use · 3 quiet · 21% CPU · 9.0 GB</text>
+<path d='M56 104h848' stroke='#4A3358'/>
+<rect x='52' y='112' width='856' height='30' rx='6' fill='#3B2450'/>
+<text x='64' y='132' class='o' style='font-weight:600'>⚡  Close Idle: stop 3 servers (1.5 GB)</text>
+<text x='64' y='166'>✦  Review Now with Haiku or Luna</text>
+<text x='88' y='190' class='dim' style='font-size:13.5px'>Last review 12m ago by Haiku · 11 hosts · 10.6k tokens · 17s</text>
+<path d='M56 206h848' stroke='#4A3358'/>
+<text x='64' y='230' class='h'>IN USE (4)</text>
+<text x='64' y='256' class='m'>◐ :3317  Vite     barkpark-studio-page-builder/app   up 23m · 0% · 905 MB · open in headless Chrome ×8</text>
+<text x='64' y='280' class='m'>◐ :3300  Vite     barkpark-studio-live/app           up 2h · 1% · 612 MB · quiet 4m</text>
+<text x='64' y='314' class='h'>QUIET FOR 30M OR MORE (3)</text>
+<text x='64' y='340' class='m'><tspan class='y'>◇</tspan> :4100  Phoenix  barkpark-local/api                 up 12d · 1% · 493 MB · quiet 3h</text>
+<text x='64' y='364' class='m'><tspan class='y'>◇</tspan> :4251  Phoenix  barkpark-studio-speed-3-base/api   up 7d · 9% · 514 MB · quiet 3h</text>
+<text x='64' y='398' class='h'>SERVICES (2)</text>
+<text x='64' y='424' class='m'>● :5432  Postgres /opt/homebrew/var/postgresql@16    up 9d · 0% · 210 MB · 30 connections</text>
+<path d='M56 444h848' stroke='#4A3358'/>
+<text x='64' y='470'>Other listeners, high ports (2)</text><text x='890' y='470' class='dim' text-anchor='end'>▸</text>
+<text x='64' y='496'>Ignored, apps and macOS (4)</text><text x='890' y='496' class='dim' text-anchor='end'>▸</text>
+<text x='64' y='522' class='dim' style='font-size:13.5px'>Review Every ▸   Model: Haiku or Luna ▸   Quiet After ▸   When a Server Won't Stop ▸</text>
+</svg>

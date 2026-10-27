@@ -1,0 +1,32 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='960' height='330' viewBox='0 0 960 330' role='img' aria-labelledby='t d'>
+<title id='t'>When Close Idle stops a server</title><desc id='d'>Two checks have to agree. First, LocoHost's own signals: no new connection and no real CPU work for 30 minutes, where an open tab with no new requests does not count. Second, the latest review by Haiku or Luna called the server idle with at least 60 percent confidence, and nothing happened after the review. Only when both agree, and the server is a dev server that is not protected, does it appear under Close Idle. Close Idle then sends SIGTERM, waits six seconds, and follows your setting for servers that refuse.</desc>
+<defs><marker id='a' viewBox='0 0 10 10' refX='8' refY='5' markerWidth='7' markerHeight='7' orient='auto'><path d='M0 0L10 5L0 10z' fill='#F2A65A'/></marker>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif;fill:#EDE6F2}.t{font-size:19px;font-weight:700}.s{font-size:14px;fill:#C9BCD6}.n{font-size:15px;font-weight:700;fill:#1B1024}</style></defs>
+<rect width='960' height='330' rx='18' fill='#1B1024'/>
+<text x='48' y='58' style='font-size:26px;font-weight:700' fill='#F2A65A'>Two checks have to agree</text>
+<text x='48' y='86' class='s' style='font-size:16px'>A server is closed only when LocoHost's own signals and the model both say nobody uses it.</text>
+
+<rect x='48' y='118' width='300' height='164' rx='14' fill='#2A1838' stroke='#4A3358'/>
+<circle cx='80' cy='150' r='16' fill='#F2A65A'/><text x='80' y='156' text-anchor='middle' class='n'>1</text>
+<text x='70' y='200' class='t'>Quiet for 30 minutes</text>
+<text x='70' y='226' class='s'>No new connection and no real</text>
+<text x='70' y='246' class='s'>CPU work. An open tab with no</text>
+<text x='70' y='266' class='s'>new requests does not count.</text>
+
+<rect x='48' y='118' width='0' height='0'/>
+<rect x='372' y='118' width='300' height='164' rx='14' fill='#2A1838' stroke='#4A3358'/>
+<circle cx='404' cy='150' r='16' fill='#F2A65A'/><text x='404' y='156' text-anchor='middle' class='n'>2</text>
+<text x='394' y='200' class='t'>The review says idle</text>
+<text x='394' y='226' class='s'>Haiku or Luna, at least 60%</text>
+<text x='394' y='246' class='s'>confident, and nothing has</text>
+<text x='394' y='266' class='s'>happened since the review.</text>
+
+<path d='M676 200h22' stroke='#F2A65A' stroke-width='2' marker-end='url(#a)'/>
+<rect x='708' y='118' width='204' height='164' rx='14' fill='#3B2450' stroke='#F2A65A'/>
+<text x='728' y='160' class='t' fill='#F2A65A' style='fill:#F2A65A'>⚡ Close Idle</text>
+<text x='728' y='192' class='s'>Dev servers only, never</text>
+<text x='728' y='212' class='s'>Postgres or protected ports.</text>
+<text x='728' y='240' class='s'>SIGTERM, six seconds,</text>
+<text x='728' y='260' class='s'>then your setting.</text>
+<text x='360' y='206' text-anchor='middle' style='font-size:22px;font-weight:700' fill='#F5C542'>+</text>
+</svg>

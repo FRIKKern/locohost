@@ -1,0 +1,916 @@
+// LocoHost: every localhost on your Mac, what it is, who started it, and whether anyone still uses it.
+// Menu bar app + CLI. Haiku or Luna on your own subscription reviews the list on a schedule,
+// and Close Idle stops the servers that both the local signals and the review call idle.
+#import <Cocoa/Cocoa.h>
+#import <ServiceManagement/ServiceManagement.h>
+#import <signal.h>
+#import <netinet/in.h>
+#import "Ports.h"
+#import "Rules.h"
+#import "Review.h"
+#import "Intel.h"
+
+static NSString *const kReviewMinKey = @"locohost.reviewMinutes";   // default 60, 0 off
+static NSString *const kModelKey     = @"locohost.model";           // default auto: Haiku, then Luna
+static NSString *const kIdleMinKey   = @"locohost.idleMinutes";     // default 30
+static NSString *const kProbeKey     = @"locohost.probeHTTP";       // default YES
+static NSString *const kAskKey       = @"locohost.askBeforeClosing";// default YES
+static NSString *const kForceKey     = @"locohost.forceMode";       // 0 leave, 1 ask (default), 2 force
+
+typedef NS_ENUM(NSInteger, LHForceMode) { LHForceNever = 0, LHForceAsk = 1, LHForceAlways = 2 };
+static const NSTimeInterval kGrace = 6;          // seconds a server gets to stop after SIGTERM
+static const double kMinConfidence = 0.6;        // an idle verdict below this does not count
+
+#pragma mark - Preferences
+
+static CFStringRef const kDomain = CFSTR("no.guerrilla.locohost");
+static id PrefGet(NSString *key) { return CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)key, kDomain)); }
+static void PrefSet(NSString *key, id value) {
+    CFPreferencesSetAppValue((__bridge CFStringRef)key, (__bridge CFPropertyListRef)value, kDomain);
+    CFPreferencesAppSynchronize(kDomain);
+}
+static BOOL PrefBool(NSString *key, BOOL dflt) { id v = PrefGet(key); return v ? [v boolValue] : dflt; }
+static NSInteger PrefInt(NSString *key, NSInteger dflt) { id v = PrefGet(key); return v ? [v integerValue] : dflt; }
+static NSString *Model(void) { id v = PrefGet(kModelKey); return [v isKindOfClass:NSString.class] && [v length] ? v : @"auto"; }
+static NSInteger IdleMinutes(void) {
+    NSString *env = NSProcessInfo.processInfo.environment[@"LOCOHOST_IDLE_MINUTES"];   // tests
+    return env.length ? env.integerValue : PrefInt(kIdleMinKey, 30);
+}
+static LHForceMode ForceMode(void) { id v = PrefGet(kForceKey); return v ? (LHForceMode)[v integerValue] : LHForceAsk; }
+
+static NSString *Plural(NSInteger n, NSString *word) { return [NSString stringWithFormat:@"%ld %@%@", (long)n, word, n == 1 ? @"" : [word hasSuffix:@"s"] ? @"es" : @"s"]; }
+static NSString *Pct(double v) { return [NSString stringWithFormat:@"%.0f%%", v]; }
+static NSString *Tokens(NSInteger t) { return t >= 1000 ? [NSString stringWithFormat:@"%.1fk tokens", t / 1000.0] : [NSString stringWithFormat:@"%ld tokens", (long)t]; }
+
+#pragma mark - Idle
+
+/// The hosts Close Idle stops. All of these must hold:
+/// it is a dev server, not protected, quiet for the idle threshold by local signals (no new connection, no CPU work),
+/// the latest review called it idle with enough confidence, and nothing happened after that review.
+/// An open but silent connection, such as a forgotten browser tab, does not keep a server alive on its own.
+static NSArray<LHHost *> *Candidates(NSArray<LHHost *> *hosts, LHReview *review) {
+    NSMutableArray *c = [NSMutableArray new];
+    if (!review || review.error) return c;
+    for (LHHost *h in hosts) {
+        if (![h.kind isEqualToString:@"dev"] || h.isProtected || h.state != LHIdle) continue;
+        LHVerdict *v = review.verdicts[h.key];
+        if (![v.verdict isEqualToString:@"idle"] || v.confidence < kMinConfidence) continue;
+        if (h.lastActive && [h.lastActive compare:review.at] == NSOrderedDescending) continue;
+        [c addObject:h];
+    }
+    return c;
+}
+
+static NSString *StateMark(LHHost *h, LHReview *r) {
+    if (h.state == LHActive) return @"●";                 // ● in use now
+    if ([r.verdicts[h.key].verdict isEqualToString:@"idle"] && h.state == LHIdle) return @"◇";   // ◇ idle, confirmed
+    return h.state == LHRecent ? @"◐" : @"○";        // ◐ recent, ○ quiet
+}
+
+static NSString *StateWords(LHHost *h) {
+    NSString *who = h.clients.count ? [h.clients componentsJoinedByString:@", "] : h.connections ? Plural(h.connections, @"connection") : nil;
+    if (h.state == LHActive) return h.newConnections ? [NSString stringWithFormat:@"requests from %@", who ?: @"a client"] : @"working (CPU)";
+    NSDate *q = h.lastActive ?: h.firstSeen;
+    NSString *quiet = [NSString stringWithFormat:@"quiet %@%@", LHDuration(-q.timeIntervalSinceNow), h.lastActive ? @"" : @"+"];
+    return who ? [NSString stringWithFormat:@"%@, open in %@", quiet, who] : quiet;
+}
+
+static NSString *Wh(double joules) { return [NSString stringWithFormat:joules >= 3600 ? @"%.1f Wh" : @"%.2f Wh", joules / 3600]; }
+
+/// What a host burned since it was last used: "since last use 3h: 12m CPU · 0.40 Wh · holds 905 MB".
+static NSString *WasteWords(LHHost *h) {
+    NSDate *since = h.lastActive ?: h.firstSeen;
+    NSMutableArray *p = [NSMutableArray arrayWithObject:[NSString stringWithFormat:@"%@ CPU", LHDuration(h.idleCPUSeconds)]];
+    if (h.energyJoules > 0) [p addObject:Wh(h.idleJoules)];
+    [p addObject:[NSString stringWithFormat:@"holds %@", LHFormatBytes(h.memory)]];
+    return [NSString stringWithFormat:@"%@ %@: %@", h.lastActive ? @"since last use" : @"since LocoHost first saw it", LHDuration(-since.timeIntervalSinceNow),
+            [p componentsJoinedByString:@" · "]];
+}
+
+/// The agent session that was open when the server started, or the plain fact that none was found.
+static NSString *SessionWords(NSDictionary *s) {
+    if (!s) return @"no agent session found";
+    NSString *t = s[@"title"] ?: s[@"first_prompt"];
+    return [NSString stringWithFormat:@"%@ session%@, last active %@ ago", s[@"agent"], t ? [NSString stringWithFormat:@" \"%@\"", t] : @"",
+            LHDuration([s[@"last_active_minutes_ago"] doubleValue] * 60)];
+}
+
+static NSString *GitWords(NSDictionary *g, LHHost *h) {
+    if (!g) return nil;
+    NSMutableArray *p = [NSMutableArray new];
+    if (h.branch) [p addObject:[@"branch " stringByAppendingString:h.branch]];
+    if (g[@"last_commit"]) [p addObject:[NSString stringWithFormat:@"last commit \"%@\" %@ ago%@", g[@"last_commit"], LHDuration([g[@"last_commit_minutes_ago"] doubleValue] * 60),
+                                         g[@"last_commit_author"] ? [@" by " stringByAppendingString:g[@"last_commit_author"]] : @""]];
+    if (g[@"dirty_files"]) [p addObject:[g[@"dirty_files"] integerValue] ? Plural([g[@"dirty_files"] integerValue], @"uncommitted file") : @"clean"];
+    if ([g[@"upstream"] isEqual:@"gone"]) [p addObject:@"remote branch deleted"];
+    else if ([g[@"upstream"] isEqual:@"none"]) [p addObject:@"never pushed"];
+    else if (g[@"upstream"]) [p addObject:[NSString stringWithFormat:@"%@ ahead, %@ behind %@", g[@"ahead"], g[@"behind"], g[@"upstream"]]];
+    if (g[@"commits_not_in_default"]) [p addObject:[NSString stringWithFormat:@"%@ not in %@", Plural([g[@"commits_not_in_default"] integerValue], @"commit"), g[@"default_branch"]]];
+    return [p componentsJoinedByString:@" · "];
+}
+
+/// The model's sentence when there is one, else what LocoHost found itself.
+static NSString *WhatWords(LHHost *h, LHVerdict *v, NSDictionary *intel) {
+    if (v.what.length) return v.what;
+    NSDictionary *p = intel[@"project"];
+    NSString *d = p[@"description"] ?: p[@"readme"];
+    return d ? [NSString stringWithFormat:@"%@ %@: %@", p[@"name"] ?: h.project, h.framework, d] : nil;
+}
+static NSString *HowWords(LHHost *h, LHVerdict *v, NSDictionary *intel) {
+    if (v.how.length) return v.how;
+    NSString *script = intel[@"project"][@"script"];
+    return [NSString stringWithFormat:@"%@%@, started by %@", h.command, script ? [NSString stringWithFormat:@" (script %@)", script] : @"", h.launcher.length ? h.launcher : @"unknown"];
+}
+
+#pragma mark - Stopping
+
+/// The processes a stop signals: the server's tree, then the package manager wrappers above it.
+static NSArray<NSNumber *> *Targets(LHHost *h) {
+    NSMutableArray *t = [h.treePids mutableCopy];
+    if (h.wrapperPid > 1) [t addObject:@(h.wrapperPid)];
+    [t removeObject:@(getpid())]; [t removeObject:@1];
+    return t;
+}
+
+static NSArray<LHHost *> *StillRunning(NSArray<LHHost *> *hosts, NSTimeInterval wait) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:wait];
+    NSMutableArray *left = [hosts mutableCopy];
+    do {
+        [left filterUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(LHHost *h, id _) { return [LHScanner alive:h]; }]];
+        if (!left.count) break;
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.25]];
+    } while ([deadline timeIntervalSinceNow] > 0);
+    return left;
+}
+
+/// closed.json: what LocoHost stopped, newest first, with the command that starts it again.
+static NSString *ClosedPath(void) { return [LHSupportDir() stringByAppendingPathComponent:@"closed.json"]; }
+static NSArray<NSDictionary *> *Closed(void) {
+    NSData *d = [NSData dataWithContentsOfFile:ClosedPath()];
+    id j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    return [j isKindOfClass:NSArray.class] ? j : @[];
+}
+static void SetClosed(NSArray *all) {
+    [NSFileManager.defaultManager createDirectoryAtPath:LHSupportDir() withIntermediateDirectories:YES attributes:nil error:nil];
+    [[NSJSONSerialization dataWithJSONObject:all ?: @[] options:NSJSONWritingPrettyPrinted error:nil] writeToFile:ClosedPath() atomically:YES];
+}
+
+static void RememberClosed(NSArray<LHHost *> *hosts) {
+    NSMutableArray *all = [Closed() mutableCopy];
+    for (LHHost *h in hosts)
+        [all insertObject:@{@"at": @(NSDate.date.timeIntervalSince1970), @"port": @(h.port), @"project": h.project,
+                            @"framework": h.framework, @"restart": h.restartCommand} atIndex:0];
+    while (all.count > 20) [all removeLastObject];
+    SetClosed(all);
+}
+
+/// SIGTERM and a grace period. Returns the hosts that are still running.
+static NSArray<LHHost *> *StopHosts(NSArray<LHHost *> *hosts, NSTimeInterval grace) {
+    NSMutableArray *live = [NSMutableArray new];
+    for (LHHost *h in hosts) if ([LHScanner alive:h]) [live addObject:h];   // never signal a reused pid
+    RememberClosed(live);
+    for (LHHost *h in live) for (NSNumber *p in Targets(h)) kill(p.intValue, SIGTERM);
+    return StillRunning(live, grace);
+}
+
+/// SIGKILL. Whatever the server had in memory is lost.
+static NSArray<LHHost *> *KillHosts(NSArray<LHHost *> *hosts) {
+    for (LHHost *h in hosts) if ([LHScanner alive:h]) for (NSNumber *p in Targets(h)) kill(p.intValue, SIGKILL);
+    return StillRunning(hosts, 2);
+}
+
+#pragma mark - CLI
+
+static void PrintJSON(id obj) {
+    NSData *d = [NSJSONSerialization dataWithJSONObject:obj options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil];
+    printf("%s\n", [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding].UTF8String);
+}
+
+static NSString *Cut(NSString *s, NSUInteger n) { return s.length > n ? [[s substringToIndex:n - 1] stringByAppendingString:@"…"] : (s ?: @""); }
+
+static void PrintHosts(NSArray<LHHost *> *hosts, LHReview *r) {
+    printf("%-3s%-7s%-16s%-38s%-9s%6s %9s  %-26s%s\n", "", "port", "what", "project", "up", "cpu", "memory", "state", "started by");
+    for (LHHost *h in hosts) {
+        NSString *proj = h.branch ? [NSString stringWithFormat:@"%@ · %@", h.project, h.branch] : h.project;
+        printf("%-3s%-7ld%-16s%-38s%-9s%5.1f%% %9s  %-26s%s\n", StateMark(h, r).UTF8String, (long)h.port, Cut(h.framework, 15).UTF8String,
+               Cut(proj, 37).UTF8String, LHDuration(-h.started.timeIntervalSinceNow).UTF8String, h.cpuPercent,
+               LHFormatBytes(h.memory).UTF8String, Cut(StateWords(h), 25).UTF8String, h.launcher.UTF8String);
+        LHVerdict *v = r.verdicts[h.key];
+        if (v) printf("       %s %s (%.0f%%): %s\n", LHModelLabel(r.model).UTF8String, v.verdict.UTF8String, v.confidence * 100, v.reason.UTF8String);
+    }
+}
+
+static NSDictionary *HostJSON(LHHost *h, LHReview *r) {
+    NSMutableDictionary *j = [h.json mutableCopy];
+    LHVerdict *v = r.verdicts[h.key];
+    if (v) j[@"review"] = @{@"verdict": v.verdict, @"confidence": @(v.confidence), @"about": v.about ?: @"", @"reason": v.reason ?: @"",
+                            @"model": r.model ?: @"", @"at": @(r.at.timeIntervalSince1970)};
+    return j;
+}
+
+static LHHost *FindHost(NSArray<LHHost *> *hosts, NSString *arg) {
+    NSInteger n = arg.integerValue;
+    for (LHHost *h in hosts) if ([h.ports containsObject:@(n)]) return h;
+    for (LHHost *h in hosts) if (h.pid == n) return h;
+    return nil;
+}
+
+static BOOL Confirm(NSString *q) {
+    printf("%s [y/N] ", q.UTF8String); fflush(stdout);
+    char buf[8] = {0};
+    return fgets(buf, sizeof buf, stdin) && (buf[0] == 'y' || buf[0] == 'Y');
+}
+
+/// Stops hosts from the CLI: SIGTERM, then SIGKILL with --force. Exit 0 all stopped, 3 some still running.
+static int CLIStop(NSArray<LHHost *> *targets, BOOL force) {
+    NSArray *left = StopHosts(targets, kGrace);
+    NSInteger forced = 0;
+    if (left.count && force) {
+        for (LHHost *h in left) printf("force stopping :%ld %s\n", (long)h.port, h.framework.UTF8String);
+        forced = left.count; left = KillHosts(left); forced -= left.count;
+    }
+    for (LHHost *h in left) printf("still running%s: :%ld %s (pid %d)\n", force ? "" : " (ignored SIGTERM; use --force)", (long)h.port, h.framework.UTF8String, h.pid);
+    printf("stopped %lu of %lu%s\n", (unsigned long)(targets.count - left.count), (unsigned long)targets.count,
+           forced ? [NSString stringWithFormat:@", %ld by force", (long)forced].UTF8String : "");
+    return left.count ? 3 : 0;
+}
+
+static int Usage(void) {
+    fprintf(stderr,
+        "usage: locohost <command> [options]\n"
+        "  list                  every localhost: port, what, project, uptime, cost, state, who started it (default)\n"
+        "  who <port>            the process on a port, its folder, branch and command, and who is connected\n"
+        "  ready <port>          wait until the port accepts connections; exit 0 ready, 1 timed out\n"
+        "  free [port]           the first free port at or above port (default 3000)\n"
+        "  explain <port>        what it is, how it runs, why it is there and what it wastes, with every fact found\n"
+        "  waste                 what each server burned since it was last used, and duplicates\n"
+        "  review                ask the model which localhosts are in use; saves the verdicts\n"
+        "  idle                  what Close Idle would stop right now\n"
+        "  close <port|pid>      stop one server: SIGTERM, then SIGKILL with --force\n"
+        "  close-idle            stop every confirmed idle server\n"
+        "  open <port>           open it in the browser\n"
+        "  stopped               what LocoHost stopped, with the command to start each again\n"
+        "  rules                 print the rules file path\n"
+        "options:\n"
+        "  --json                machine-readable output\n"
+        "  --yes                 do not ask\n"
+        "  --force               SIGKILL servers that ignore SIGTERM\n"
+        "  --timeout <s>         ready: give up after this many seconds (default 60)\n"
+        "  --http                ready: also wait for an HTTP answer below 500\n"
+        "  --model <alias>       review: auto (Haiku, then Luna), haiku, sonnet, opus, luna or a full model name (setting: locohost.model)\n"
+        "  --review              close-idle: run a review first\n"
+        "  --port <port>         close-idle: only this port\n");
+    return 2;
+}
+
+static NSInteger HTTPStatus(NSInteger port) {
+    __block NSInteger status = 0;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSURLSessionConfiguration *cfg = NSURLSessionConfiguration.ephemeralSessionConfiguration;
+    cfg.timeoutIntervalForRequest = 2;
+    NSURLSession *s = [NSURLSession sessionWithConfiguration:cfg];
+    [[s dataTaskWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%ld/", (long)port]]
+      completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        if ([resp isKindOfClass:NSHTTPURLResponse.class]) status = ((NSHTTPURLResponse *)resp).statusCode;
+        dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+    [s invalidateAndCancel];
+    return status;
+}
+
+static BOOL PortFree(NSInteger port) {
+    if (LHPortListening(port)) return NO;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {0}; a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = htonl(INADDR_ANY);
+    BOOL ok = bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0;
+    close(fd);
+    return ok;
+}
+
+static int RunCLI(int argc, const char **argv) {
+    NSMutableArray<NSString *> *args = [NSMutableArray new];
+    for (int i = 1; i < argc; i++) [args addObject:@(argv[i])];
+    NSString *cmd = args.firstObject ?: @"list";
+    BOOL json = [args containsObject:@"--json"], yes = [args containsObject:@"--yes"], force = [args containsObject:@"--force"];
+    NSString *(^opt)(NSString *) = ^NSString *(NSString *name) {
+        NSUInteger i = [args indexOfObject:name];
+        return (i != NSNotFound && i + 1 < args.count) ? args[i + 1] : nil;
+    };
+    NSString *arg1 = args.count > 1 && ![args[1] hasPrefix:@"--"] ? args[1] : nil;
+
+    if ([cmd isEqualToString:@"rules"]) { printf("%s\n", LHRules.shared.fileURL.path.UTF8String); return 0; }
+    if ([cmd isEqualToString:@"stopped"]) {
+        if (json) { PrintJSON(Closed()); return 0; }
+        for (NSDictionary *c in Closed())
+            printf(":%-6s %-14s %s ago\n        %s\n", [c[@"port"] description].UTF8String, [c[@"framework"] UTF8String],
+                   LHDuration(NSDate.date.timeIntervalSince1970 - [c[@"at"] doubleValue]).UTF8String, [c[@"restart"] UTF8String]);
+        return 0;
+    }
+    if ([cmd isEqualToString:@"free"]) {
+        for (NSInteger p = arg1 ? arg1.integerValue : 3000; p < 65536; p++) if (PortFree(p)) { printf("%ld\n", (long)p); return 0; }
+        return 1;
+    }
+    if ([cmd isEqualToString:@"ready"]) {
+        if (!arg1) return Usage();
+        NSInteger port = arg1.integerValue;
+        double timeout = opt(@"--timeout") ? opt(@"--timeout").doubleValue : 60;
+        BOOL http = [args containsObject:@"--http"];
+        NSDate *start = NSDate.date;
+        while (-start.timeIntervalSinceNow < timeout) {
+            if (LHPortListening(port)) {
+                NSInteger st = http ? HTTPStatus(port) : 0;
+                if (!http || (st > 0 && st < 500)) {
+                    printf("ready :%ld after %.1fs%s\n", (long)port, -start.timeIntervalSinceNow, http ? [NSString stringWithFormat:@" (HTTP %ld)", (long)st].UTF8String : "");
+                    return 0;
+                }
+            }
+            [NSThread sleepForTimeInterval:0.25];
+        }
+        fprintf(stderr, "not ready: nothing %s on :%ld after %.0fs\n", http ? "answered HTTP" : "accepted a connection", (long)port, timeout);
+        return 1;
+    }
+    if ([cmd isEqualToString:@"open"]) {
+        if (!arg1) return Usage();
+        [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:[NSString stringWithFormat:@"http://localhost:%@", arg1]]];
+        return 0;
+    }
+    if (![@[@"list", @"who", @"explain", @"waste", @"review", @"idle", @"close", @"close-idle"] containsObject:cmd]) return Usage();
+
+    LHScanner *s = [LHScanner new];
+    s.idleSeconds = IdleMinutes() * 60;
+    [s sample]; [NSThread sleepForTimeInterval:1.0]; [s sample];   // two samples for CPU%
+    if (PrefBool(kProbeKey, YES) && ![cmd hasPrefix:@"close"]) {
+        __block BOOL done = NO;
+        [s probeHosts:^{ done = YES; }];
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:4];
+        while (!done && deadline.timeIntervalSinceNow > 0) [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    }
+    LHReview *review = [LHReview load];
+
+    if ([cmd isEqualToString:@"list"]) {
+        BOOL all = [args containsObject:@"--all"];
+        if (json) {
+            NSMutableArray *o = [NSMutableArray new], *ig = [NSMutableArray new];
+            for (LHHost *h in s.hosts) [o addObject:HostJSON(h, review)];
+            for (LHIgnored *i in s.ignored) [ig addObject:@{@"pid": @(i.pid), @"name": i.name, @"ports": i.ports}];
+            PrintJSON(@{@"hosts": o, @"ignored": ig, @"idleMinutes": @(IdleMinutes()),
+                        @"watchingSince": @(s.watchingSince.timeIntervalSince1970), @"candidates": [Candidates(s.hosts, review) valueForKey:@"key"]});
+            return 0;
+        }
+        if (!s.hosts.count) { printf("no localhosts running\n"); return 0; }
+        PrintHosts(s.hosts, review);
+        uint64_t mem = 0; double cpu = 0; NSInteger active = 0, idle = 0;
+        for (LHHost *h in s.hosts) { mem += h.memory; cpu += h.cpuPercent; active += h.state == LHActive; idle += h.state == LHIdle; }
+        printf("\n%s: %ld in use now, %ld quiet over %ldm · %s CPU · %s · watching for %s\n", Plural(s.hosts.count, @"localhost").UTF8String,
+               (long)active, (long)idle, (long)IdleMinutes(), Pct(cpu).UTF8String, LHFormatBytes(mem).UTF8String, LHDuration(-s.watchingSince.timeIntervalSinceNow).UTF8String);
+        if (review) printf("last review: %s ago by %s%s\n", LHDuration(-review.at.timeIntervalSinceNow).UTF8String, LHModelLabel(review.model).UTF8String,
+                           review.error ? [NSString stringWithFormat:@" (failed: %@)", review.error].UTF8String : "");
+        if (all && s.ignored.count) {
+            printf("\nignored (macOS and apps, never touched):\n");
+            for (LHIgnored *i in s.ignored) printf("  %-24s pid %-7d %s\n", i.name.UTF8String, i.pid, [[i.ports valueForKey:@"stringValue"] componentsJoinedByString:@", "].UTF8String);
+        }
+        return 0;
+    }
+
+    if ([cmd isEqualToString:@"who"]) {
+        if (!arg1) return Usage();
+        LHHost *h = FindHost(s.hosts, arg1);
+        if (!h) {
+            for (LHIgnored *i in s.ignored) if ([i.ports containsObject:@(arg1.integerValue)]) { printf(":%s is held by %s (pid %d), which LocoHost ignores\n", arg1.UTF8String, i.name.UTF8String, i.pid); return 0; }
+            printf(":%s is %s\n", arg1.UTF8String, LHPortListening(arg1.integerValue) ? "taken by a process LocoHost cannot read (another user or root)" : "free");
+            return 1;
+        }
+        if (json) { PrintJSON(HostJSON(h, review)); return 0; }
+        printf(":%ld  %s  pid %d  (%s)\n", (long)h.port, h.framework.UTF8String, h.pid, h.kind.UTF8String);
+        printf("  ports      %s on %s\n", [[h.ports valueForKey:@"stringValue"] componentsJoinedByString:@", "].UTF8String, h.bind.UTF8String);
+        printf("  folder     %s\n", h.cwd.stringByAbbreviatingWithTildeInPath.UTF8String);
+        if (h.repo) printf("  repo       %s%s%s\n", h.repo.UTF8String, h.branch ? [NSString stringWithFormat:@" on %@", h.branch].UTF8String : "",
+                           h.worktree ? [NSString stringWithFormat:@", worktree %@", h.worktree].UTF8String : "");
+        printf("  command    %s\n", h.command.UTF8String);
+        printf("  started by %s\n", h.launcher.UTF8String);
+        printf("  up         %s · CPU %.1f%% now, %s total · %s in %s\n", LHDuration(-h.started.timeIntervalSinceNow).UTF8String, h.cpuPercent,
+               LHDuration(h.cpuSeconds).UTF8String, LHFormatBytes(h.memory).UTF8String, Plural(h.processCount, @"process").UTF8String);
+        printf("  clients    %s%s\n", h.clients.count ? [h.clients componentsJoinedByString:@", "].UTF8String : h.connections ? Plural(h.connections, @"connection").UTF8String : "none now",
+               h.newConnections ? [NSString stringWithFormat:@" (%ld new)", (long)h.newConnections].UTF8String : "");
+        printf("  state      %s\n", StateWords(h).UTF8String);
+        if (h.title || h.httpStatus) printf("  page       %s (HTTP %ld)\n", (h.title ?: @"no title").UTF8String, (long)h.httpStatus);
+        LHVerdict *v = review.verdicts[h.key];
+        if (v) printf("  review     %s %s (%.0f%%), %s ago: %s\n", LHModelLabel(review.model).UTF8String, v.verdict.UTF8String, v.confidence * 100,
+                      LHDuration(-review.at.timeIntervalSinceNow).UTF8String, v.reason.UTF8String);
+        NSDictionary *intel = LHIntel(h, YES);
+        if (WhatWords(h, v, intel)) printf("  what       %s\n", WhatWords(h, v, intel).UTF8String);
+        if ([h.kind isEqualToString:@"dev"]) printf("  why        %s\n", (v.why.length ? v.why : SessionWords(intel[@"session"])).UTF8String);
+        printf("  waste      %s\n", WasteWords(h).UTF8String);
+        if (h.duplicates.count) printf("  duplicate  same folder and branch as :%s\n", [[h.duplicates valueForKey:@"stringValue"] componentsJoinedByString:@", :"].UTF8String);
+        if (h.isProtected) printf("  protected  Close Idle never stops it\n");
+        return 0;
+    }
+
+    if ([cmd isEqualToString:@"explain"]) {
+        if (!arg1) return Usage();
+        LHHost *h = FindHost(s.hosts, arg1);
+        if (!h) { fprintf(stderr, "no localhost on %s\n", arg1.UTF8String); return 1; }
+        NSDictionary *intel = LHIntel(h, YES) ?: @{};
+        LHVerdict *v = review.verdicts[h.key];
+        if (json) {
+            NSMutableDictionary *j = [HostJSON(h, review) mutableCopy];
+            j[@"intel"] = intel; j[@"waste"] = LHWasteFacts(h);
+            PrintJSON(j); return 0;
+        }
+        printf(":%ld  %s  %s  (pid %d, %s)\n\n", (long)h.port, h.framework.UTF8String, h.project.UTF8String, h.pid, h.kind.UTF8String);
+        NSString *what = WhatWords(h, v, intel);
+        printf("  What      %s\n", (what ?: @"no project description found").UTF8String);
+        printf("  How       %s\n", HowWords(h, v, intel).UTF8String);
+        if ([h.kind isEqualToString:@"dev"]) printf("  Why       %s\n", (v.why.length ? v.why : SessionWords(intel[@"session"])).UTF8String);
+        printf("  Waste     %s\n", (v.waste.length ? v.waste : WasteWords(h)).UTF8String);
+        if (v) printf("  Verdict   %s says %s (%.0f%%), %s ago: %s\n", LHModelLabel(review.model).UTF8String, v.verdict.UTF8String, v.confidence * 100,
+                      LHDuration(-review.at.timeIntervalSinceNow).UTF8String, v.reason.UTF8String);
+        if (v.recommendation.length) printf("  Advice    %s\n", v.recommendation.UTF8String);
+        if (!v.what.length) printf("            (no review with explanations yet: run `locohost review`)\n");
+
+        printf("\nWhat LocoHost found\n");
+        NSDictionary *p = intel[@"project"];
+        if (p[@"name"] || p[@"description"]) printf("  project   %s%s\n", [p[@"name"] ?: h.project UTF8String], p[@"description"] ? [NSString stringWithFormat:@": %@", p[@"description"]].UTF8String : "");
+        if (p[@"script"]) printf("  script    %s\n", [p[@"script"] UTF8String]);
+        if (p[@"app"]) printf("  mix app   %s\n", [p[@"app"] UTF8String]);
+        if (p[@"readme"]) printf("  readme    %s\n", [p[@"readme"] UTF8String]);
+        if ([p[@"configs"] count]) printf("  configs   %s\n", [p[@"configs"] componentsJoinedByString:@", "].UTF8String);
+        if (!p) printf("  project   no package.json, README, mix.exs or pyproject.toml in its folders\n");
+        printf("  command   %s\n  started   %s, %s ago\n", h.command.UTF8String, h.launcher.UTF8String, LHDuration(-h.started.timeIntervalSinceNow).UTF8String);
+        if (GitWords(intel[@"git"], h)) printf("  git       %s\n", GitWords(intel[@"git"], h).UTF8String);
+        NSDictionary *se = intel[@"session"];
+        printf("  session   %s\n", SessionWords(se).UTF8String);
+        if (se) {
+            printf("            started %s ago · %s%s\n", LHDuration([se[@"started_minutes_ago"] doubleValue] * 60).UTF8String, [se[@"match"] UTF8String],
+                   se[@"other_matches"] ? [NSString stringWithFormat:@" · %@ other sessions also match", se[@"other_matches"]].UTF8String : "");
+            if (se[@"first_prompt"]) printf("            first prompt: %s\n", [se[@"first_prompt"] UTF8String]);
+            printf("            %s\n", [se[@"file"] UTF8String]);
+        }
+        printf("  waste     %s\n", WasteWords(h).UTF8String);
+        if (h.energyJoules > 0) printf("            %s and %s CPU since it started\n", Wh(h.energyJoules).UTF8String, LHDuration(h.cpuSeconds).UTF8String);
+        if (h.duplicates.count) printf("  duplicate same folder and branch as :%s\n", [[h.duplicates valueForKey:@"stringValue"] componentsJoinedByString:@", :"].UTF8String);
+        printf("  clients   %s\n  state     %s\n", h.clients.count ? [h.clients componentsJoinedByString:@", "].UTF8String : "none now", StateWords(h).UTF8String);
+        return 0;
+    }
+
+    if ([cmd isEqualToString:@"waste"]) {
+        NSArray *dev = [s.hosts filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"kind == 'dev'"]];
+        dev = [dev sortedArrayUsingComparator:^NSComparisonResult(LHHost *a, LHHost *b) {
+            double wa = a.state == LHIdle ? -[(a.lastActive ?: a.firstSeen) timeIntervalSinceNow] * a.memory : 0, wb = b.state == LHIdle ? -[(b.lastActive ?: b.firstSeen) timeIntervalSinceNow] * b.memory : 0;
+            return wa > wb ? NSOrderedAscending : wa < wb ? NSOrderedDescending : [@(a.port) compare:@(b.port)];
+        }];
+        double cpu = 0, joules = 0; uint64_t mem = 0; NSInteger idle = 0;
+        for (LHHost *h in dev) if (h.state == LHIdle) { idle++; cpu += h.idleCPUSeconds; joules += h.idleJoules; mem += h.memory; }
+        BOOL energy = [[dev valueForKeyPath:@"@max.energyJoules"] doubleValue] > 0;
+        if (json) {
+            NSMutableArray *o = [NSMutableArray new];
+            for (LHHost *h in dev) [o addObject:@{@"key": h.key, @"port": @(h.port), @"project": h.project, @"state": h.state == LHIdle ? @"idle" : h.state == LHRecent ? @"recent" : @"active",
+                                                  @"waste": LHWasteFacts(h), @"duplicates": h.duplicates ?: @[]}];
+            PrintJSON(@{@"hosts": o, @"idle": @{@"count": @(idle), @"cpuSeconds": @(round(cpu)), @"energyWh": energy ? @(round(joules / 3.6) / 1000) : NSNull.null, @"memoryBytes": @(mem)}});
+            return 0;
+        }
+        if (!dev.count) { printf("no dev servers running\n"); return 0; }
+        printf("%-3s%-7s%-14s%-38s%-10s%9s%10s%10s\n", "", "port", "what", "project", "unused", "cpu", "energy", "memory");
+        for (LHHost *h in dev)
+            printf("%-3s%-7ld%-14s%-38s%-10s%9s%10s%10s%s\n", StateMark(h, review).UTF8String, (long)h.port, Cut(h.framework, 13).UTF8String, Cut(h.project, 37).UTF8String,
+                   h.state == LHActive ? "now" : LHDuration(-(h.lastActive ?: h.firstSeen).timeIntervalSinceNow).UTF8String, LHDuration(h.idleCPUSeconds).UTF8String,
+                   energy ? Wh(h.idleJoules).UTF8String : "-", LHFormatBytes(h.memory).UTF8String,
+                   h.duplicates.count ? [NSString stringWithFormat:@"  duplicate of :%@", [[h.duplicates valueForKey:@"stringValue"] componentsJoinedByString:@", :"]].UTF8String : "");
+        printf("\n%s quiet over %ldm hold %s and burned %s CPU%s since they were last used\n", Plural(idle, @"server").UTF8String, (long)IdleMinutes(),
+               LHFormatBytes(mem).UTF8String, LHDuration(cpu).UTF8String, energy ? [NSString stringWithFormat:@" and %@", Wh(joules)].UTF8String : "");
+        return 0;
+    }
+
+    if ([cmd isEqualToString:@"review"] || ([cmd isEqualToString:@"close-idle"] && [args containsObject:@"--review"])) {
+        NSString *model = opt(@"--model") ?: Model();
+        if (!json) { fprintf(stderr, "reviewing %s with %s…\n", Plural(s.hosts.count, @"localhost").UTF8String, LHModelLabel(model).UTF8String); }
+        review = [LHReviewer review:s.hosts scanner:s model:model];
+        [review save];
+        if (review.error) { fprintf(stderr, "review failed: %s\n", review.error.UTF8String); return 1; }
+        if (review.note && !json) fprintf(stderr, "%s, so %s answered\n", review.note.UTF8String, LHModelLabel(review.model).UTF8String);
+        if ([cmd isEqualToString:@"review"]) {
+            if (json) {
+                NSMutableArray *o = [NSMutableArray new];
+                for (LHHost *h in s.hosts) [o addObject:HostJSON(h, review)];
+                PrintJSON(@{@"hosts": o, @"model": review.model ?: model, @"note": review.note ?: NSNull.null, @"tokens": @(review.tokens), @"seconds": @(review.seconds),
+                            @"candidates": [Candidates(s.hosts, review) valueForKey:@"key"]});
+                return 0;
+            }
+            for (LHHost *h in s.hosts) {
+                LHVerdict *v = review.verdicts[h.key];
+                printf("%-3s:%-6ld %-7s %3.0f%%  %s\n         %s\n", StateMark(h, review).UTF8String, (long)h.port, (v.verdict ?: @"-").UTF8String,
+                       v.confidence * 100, (v.about ?: h.framework).UTF8String, (v.reason ?: @"no verdict").UTF8String);
+            }
+            printf("\n%s in %.0fs · %s · %ld confirmed idle now\n", LHModelLabel(review.model).UTF8String, review.seconds, Tokens(review.tokens).UTF8String,
+                   (long)Candidates(s.hosts, review).count);
+            return 0;
+        }
+    }
+
+    if ([cmd isEqualToString:@"idle"] || [cmd isEqualToString:@"close-idle"]) {
+        NSArray<LHHost *> *c = Candidates(s.hosts, review);
+        if (opt(@"--port")) c = [c filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(LHHost *h, id _) { return [h.ports containsObject:@(opt(@"--port").integerValue)]; }]];
+        if (json && [cmd isEqualToString:@"idle"]) {
+            NSMutableArray *o = [NSMutableArray new];
+            for (LHHost *h in c) [o addObject:HostJSON(h, review)];
+            PrintJSON(@{@"candidates": o, @"reviewAt": review ? @(review.at.timeIntervalSince1970) : NSNull.null});
+            return 0;
+        }
+        if (!review) printf("no review yet: run `locohost review` or wait for the scheduled one\n");
+        uint64_t mem = 0;
+        for (LHHost *h in c) {
+            mem += h.memory;
+            printf("  :%-6ld %-14s %-36s up %-8s %9s  %s\n", (long)h.port, Cut(h.framework, 14).UTF8String, Cut(h.project, 36).UTF8String,
+                   LHDuration(-h.started.timeIntervalSinceNow).UTF8String, LHFormatBytes(h.memory).UTF8String, review.verdicts[h.key].reason.UTF8String);
+        }
+        if (!c.count) { printf("nothing confirmed idle\n"); return 0; }
+        if ([cmd isEqualToString:@"idle"]) { printf("%s confirmed idle · %s\n", Plural(c.count, @"server").UTF8String, LHFormatBytes(mem).UTF8String); return 0; }
+        if (!yes && !Confirm([NSString stringWithFormat:@"Stop %@ (%@)?%@", Plural(c.count, @"server"), LHFormatBytes(mem), force ? @" Servers that ignore SIGTERM will be KILLED." : @""])) { printf("aborted\n"); return 1; }
+        return CLIStop(c, force);
+    }
+
+    if ([cmd isEqualToString:@"close"]) {
+        if (!arg1) return Usage();
+        LHHost *h = FindHost(s.hosts, arg1);
+        if (!h) { fprintf(stderr, "no localhost on %s\n", arg1.UTF8String); return 1; }
+        if (!yes && !Confirm([NSString stringWithFormat:@"Stop :%ld %@ in %@ (pid %d)?", (long)h.port, h.framework, h.project, h.pid])) { printf("aborted\n"); return 1; }
+        return CLIStop(@[h], force);
+    }
+    return Usage();
+}
+
+#pragma mark - App
+
+@interface LocoHost : NSObject <NSApplicationDelegate>
+@property (strong) NSStatusItem *statusItem;
+@property (strong) LHScanner *scanner;
+@property (strong) LHReview *review;
+@property (strong) NSTimer *timer;
+@property BOOL reviewing;
+@property NSInteger ticks;
+@end
+
+@implementation LocoHost
+
+- (void)applicationDidFinishLaunching:(NSNotification *)n {
+    self.scanner = [LHScanner new];
+    self.review = [LHReview load];
+    self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+    self.statusItem.button.target = self;
+    self.statusItem.button.action = @selector(handleClick:);
+    self.statusItem.button.imagePosition = NSImageLeft;
+    [self.statusItem.button sendActionOn:NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp];
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:5 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+    self.timer.tolerance = 1;
+    [self tick];
+}
+
+- (void)tick {
+    self.scanner.idleSeconds = IdleMinutes() * 60;
+    [self.scanner sample];
+    for (LHHost *h in self.scanner.hosts) LHIntel(h, NO);   // reads project, git and sessions in the background, five-minute cache
+    if (self.ticks++ % 6 == 0 && PrefBool(kProbeKey, YES)) [self.scanner probeHosts:nil];   // every 30 s, each host at most every 5 min
+    NSInteger every = PrefInt(kReviewMinKey, 60);
+    if (every > 0 && !self.reviewing && self.scanner.hosts.count &&
+        (!self.review || -self.review.at.timeIntervalSinceNow >= every * 60)) [self reviewNow];
+    [self updateButton];
+}
+
+- (void)updateButton {
+    NSArray *dev = [self.scanner.hosts filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"kind != 'other'"]];
+    NSInteger idle = Candidates(self.scanner.hosts, self.review).count;
+    NSImage *img = [NSImage imageWithSystemSymbolName:idle ? @"server.rack" : @"network" accessibilityDescription:@"LocoHost"];
+    img = [img imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithPointSize:14 weight:NSFontWeightRegular]];
+    img.template = YES;
+    self.statusItem.button.image = img;
+    NSString *t = idle ? [NSString stringWithFormat:@" %lu · %ld idle", (unsigned long)dev.count, (long)idle] : [NSString stringWithFormat:@" %lu", (unsigned long)dev.count];
+    self.statusItem.button.attributedTitle = [[NSAttributedString alloc] initWithString:t attributes:@{
+        NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular]}];
+    self.statusItem.button.toolTip = [NSString stringWithFormat:@"LocoHost: %@, %ld confirmed idle", Plural(dev.count, @"localhost"), (long)idle];
+}
+
+#pragma mark Review
+
+- (void)reviewNow {
+    if (self.reviewing) return;
+    self.reviewing = YES;
+    NSArray *hosts = self.scanner.hosts; LHScanner *s = self.scanner; NSString *model = Model();
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        LHReview *r = [LHReviewer review:hosts scanner:s model:model];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [r save];
+            self.review = r; self.reviewing = NO;
+            [self updateButton];
+        });
+    });
+}
+
+#pragma mark Menu
+
+static NSMenuItem *Item(NSMenu *m, NSString *t, SEL a, id target, BOOL on) {
+    NSMenuItem *i = [[NSMenuItem alloc] initWithTitle:t action:a keyEquivalent:@""];
+    i.target = target; i.state = on ? NSControlStateValueOn : NSControlStateValueOff; [m addItem:i]; return i;
+}
+static NSMenuItem *Header(NSMenu *m, NSString *t) { NSMenuItem *i = Item(m, t, NULL, nil, NO); i.enabled = NO; return i; }
+static NSMenuItem *Sub(NSMenu *m, NSString *t, NSMenu *sub) { NSMenuItem *i = Item(m, t, NULL, nil, NO); i.submenu = sub; return i; }
+
+- (NSAttributedString *)rowTitle:(LHHost *)h {
+    NSColor *dot = h.state == LHActive ? NSColor.systemGreenColor : [StateMark(h, self.review) isEqualToString:@"◇"] ? NSColor.systemOrangeColor
+                 : h.state == LHRecent ? NSColor.systemYellowColor : NSColor.tertiaryLabelColor;
+    NSFont *f = [NSFont menuFontOfSize:0], *mono = [NSFont monospacedDigitSystemFontOfSize:f.pointSize weight:NSFontWeightSemibold];
+    NSMutableAttributedString *s = [NSMutableAttributedString new];
+    [s appendAttributedString:[[NSAttributedString alloc] initWithString:[StateMark(h, self.review) stringByAppendingString:@" "] attributes:@{NSForegroundColorAttributeName: dot, NSFontAttributeName: f}]];
+    [s appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@":%-5ld ", (long)h.port] attributes:@{NSFontAttributeName: mono}]];
+    [s appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"%@  %@", h.framework, Cut(h.project, 44)] attributes:@{NSFontAttributeName: f}]];
+    if (h.branch) [s appendAttributedString:[[NSAttributedString alloc] initWithString:[@"  " stringByAppendingString:Cut(h.branch, 28)] attributes:@{NSForegroundColorAttributeName: NSColor.secondaryLabelColor, NSFontAttributeName: f}]];
+    NSString *meta = [NSString stringWithFormat:@"    up %@ · %@ · %@ · %@", LHDuration(-h.started.timeIntervalSinceNow), Pct(h.cpuPercent), LHFormatBytes(h.memory), StateWords(h)];
+    [s appendAttributedString:[[NSAttributedString alloc] initWithString:meta attributes:@{NSForegroundColorAttributeName: NSColor.secondaryLabelColor, NSFontAttributeName: f}]];
+    return s;
+}
+
+- (NSMenuItem *)hostItem:(LHHost *)h {
+    NSMenuItem *i = [[NSMenuItem alloc] initWithTitle:h.framework action:nil keyEquivalent:@""];
+    i.attributedTitle = [self rowTitle:h];
+    NSMenu *m = [NSMenu new];
+    LHVerdict *v = self.review.verdicts[h.key];
+    NSDictionary *intel = LHIntel(h, NO);
+    if (v.about.length) Header(m, v.about);
+    NSString *what = WhatWords(h, v, intel), *how = HowWords(h, v, intel);
+    if (what) Header(m, [@"What: " stringByAppendingString:Cut(what, 100)]).toolTip = what;
+    Header(m, [@"How: " stringByAppendingString:Cut(how, 100)]).toolTip = how;
+    if ([h.kind isEqualToString:@"dev"]) {
+        NSString *why = v.why.length ? v.why : intel ? SessionWords(intel[@"session"]) : @"looking for the agent session…";
+        Header(m, [@"Why: " stringByAppendingString:Cut(why, 100)]).toolTip = why;
+    }
+    NSString *waste = v.waste.length ? [NSString stringWithFormat:@"%@ (%@)", v.waste, WasteWords(h)] : WasteWords(h);
+    Header(m, [@"Waste: " stringByAppendingString:Cut(waste, 100)]).toolTip = waste;
+    if (h.duplicates.count) Header(m, [NSString stringWithFormat:@"Duplicate: same folder and branch as :%@", [[h.duplicates valueForKey:@"stringValue"] componentsJoinedByString:@", :"]]);
+    if (v.recommendation.length) Header(m, [@"Advice: " stringByAppendingString:Cut(v.recommendation, 100)]).toolTip = v.recommendation;
+    if (GitWords(intel[@"git"], h)) Header(m, [@"Git: " stringByAppendingString:Cut(GitWords(intel[@"git"], h), 100)]).toolTip = GitWords(intel[@"git"], h);
+    [m addItem:NSMenuItem.separatorItem];
+    if (h.title.length) Header(m, [NSString stringWithFormat:@"Page: %@ (HTTP %ld)", h.title, (long)h.httpStatus]);
+    Header(m, [NSString stringWithFormat:@"%@ · %@", h.cwd.stringByAbbreviatingWithTildeInPath ?: @"?", h.branch ? [NSString stringWithFormat:@"branch %@", h.branch] : @"no git"]);
+    if (h.worktree) Header(m, [NSString stringWithFormat:@"Worktree %@ of %@", h.worktree, h.repo]);
+    Header(m, [@"Command: " stringByAppendingString:Cut(h.command, 90)]).toolTip = h.command;
+    Header(m, [@"Started by: " stringByAppendingString:h.launcher.length ? h.launcher : @"unknown"]);
+    Header(m, [NSString stringWithFormat:@"Up %@ · CPU %@ now, %@ total · %@ in %@", LHDuration(-h.started.timeIntervalSinceNow), Pct(h.cpuPercent),
+               LHDuration(h.cpuSeconds), LHFormatBytes(h.memory), Plural(h.processCount, @"process")]);
+    Header(m, [NSString stringWithFormat:@"Ports %@ on %@ · pid %d", [[h.ports valueForKey:@"stringValue"] componentsJoinedByString:@", "], h.bind, h.pid]);
+    Header(m, h.clients.count ? [NSString stringWithFormat:@"Connected now: %@ · %@", [h.clients componentsJoinedByString:@", "], StateWords(h)]
+            : [NSString stringWithFormat:@"No clients now · %@", h.lastActive ? [NSString stringWithFormat:@"last activity %@ ago", LHDuration(-h.lastActive.timeIntervalSinceNow)]
+                                                                               : [NSString stringWithFormat:@"no activity in %@ of watching", LHDuration(-h.firstSeen.timeIntervalSinceNow)]]);
+    if (v) Header(m, [NSString stringWithFormat:@"%@: %@ (%.0f%%) · %@", LHModelLabel(self.review.model), v.verdict, v.confidence * 100, Cut(v.reason, 90)]).toolTip = v.reason;
+    [m addItem:NSMenuItem.separatorItem];
+    if (![h.kind isEqualToString:@"service"] || h.httpStatus) {
+        Item(m, [@"Open " stringByAppendingString:h.url], @selector(openHost:), self, NO).representedObject = h;
+        Item(m, @"Copy URL", @selector(copyURL:), self, NO).representedObject = h;
+    }
+    if (h.cwd.length > 1) Item(m, @"Reveal Folder in Finder", @selector(reveal:), self, NO).representedObject = h;
+    Item(m, @"Copy Restart Command", @selector(copyRestart:), self, NO).representedObject = h;
+    [m addItem:NSMenuItem.separatorItem];
+    Item(m, @"Protect (Close Idle Never Stops It)", @selector(toggleProtect:), self, [LHRules.shared protectsPort:h.port]).representedObject = h;
+    Item(m, @"Stop", @selector(stopOne:), self, NO).representedObject = h;
+    Item(m, @"Force Stop", @selector(killOne:), self, NO).representedObject = h;
+    i.submenu = m;
+    return i;
+}
+
+- (void)handleClick:(id)sender {
+    [self.scanner sample];
+    LHReview *r = self.review;
+    NSArray<LHHost *> *hosts = self.scanner.hosts;
+    NSArray<LHHost *> *idle = Candidates(hosts, r);
+    NSPredicate *dev = [NSPredicate predicateWithFormat:@"kind == 'dev'"];
+    NSArray *devs = [hosts filteredArrayUsingPredicate:dev];
+    NSArray *inUse = [devs filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"state != %d", LHIdle]];
+    NSArray *quiet = [devs filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"state == %d", LHIdle]];
+    NSArray *services = [hosts filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"kind == 'service'"]];
+    NSArray *others = [hosts filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"kind == 'other'"]];
+    uint64_t mem = 0, idleMem = 0; double cpu = 0;
+    for (LHHost *h in hosts) { mem += h.memory; cpu += h.cpuPercent; }
+    for (LHHost *h in idle) idleMem += h.memory;
+
+    NSMenu *menu = [NSMenu new];
+    Header(menu, [NSString stringWithFormat:@"%@ · %lu in use · %lu quiet · %@ CPU · %@", Plural(devs.count + services.count, @"localhost"),
+                  (unsigned long)inUse.count, (unsigned long)quiet.count, Pct(cpu), LHFormatBytes(mem)]);
+    if (quiet.count) {
+        double wCPU = 0, wJ = 0; uint64_t wMem = 0;
+        for (LHHost *h in quiet) { wCPU += h.idleCPUSeconds; wJ += h.idleJoules; wMem += h.memory; }
+        Header(menu, [NSString stringWithFormat:@"Quiet servers hold %@ and burned %@ CPU%@ since last use", LHFormatBytes(wMem), LHDuration(wCPU),
+                      wJ > 0 ? [NSString stringWithFormat:@" and %@", Wh(wJ)] : @""]);
+    }
+    [menu addItem:NSMenuItem.separatorItem];
+
+    NSMenuItem *go = Item(menu, idle.count ? [NSString stringWithFormat:@"Close Idle: stop %@ (%@)", Plural(idle.count, @"server"), LHFormatBytes(idleMem)]
+                                           : @"Close Idle: nothing confirmed idle", @selector(closeIdle), self, NO);
+    go.enabled = idle.count > 0;
+    go.image = [NSImage imageWithSystemSymbolName:@"bolt.fill" accessibilityDescription:nil];
+    go.toolTip = [NSString stringWithFormat:@"A server is confirmed idle when it has been quiet for %ld minutes, has no connection now, the last review called it idle, and nothing happened since that review. Services and protected ports are never included.", (long)IdleMinutes()];
+    NSString *label = LHModelLabel(Model());
+    NSMenuItem *rv = Item(menu, self.reviewing ? [NSString stringWithFormat:@"Reviewing with %@…", label] : [NSString stringWithFormat:@"Review Now with %@", label],
+                          @selector(reviewNow), self, NO);
+    rv.enabled = !self.reviewing && hosts.count;
+    rv.image = [NSImage imageWithSystemSymbolName:@"sparkles" accessibilityDescription:nil];
+    if (r) Header(menu, r.error ? [NSString stringWithFormat:@"   Last review failed: %@", Cut(r.error, 70)]
+                              : [NSString stringWithFormat:@"   Last review %@ ago by %@ · %@ · %@ · %.0fs", LHDuration(-r.at.timeIntervalSinceNow),
+                                 LHModelLabel(r.model), Plural(r.hostCount, @"host"), Tokens(r.tokens), r.seconds]).toolTip = r.error ?: r.note;
+    [menu addItem:NSMenuItem.separatorItem];
+
+    if (!hosts.count) Header(menu, @"No localhosts running");
+    if (inUse.count) { Header(menu, [NSString stringWithFormat:@"In use (%lu)", (unsigned long)inUse.count]); for (LHHost *h in inUse) [menu addItem:[self hostItem:h]]; }
+    if (quiet.count) { Header(menu, [NSString stringWithFormat:@"Quiet for %ldm or more (%lu)", (long)IdleMinutes(), (unsigned long)quiet.count]); for (LHHost *h in quiet) [menu addItem:[self hostItem:h]]; }
+    if (services.count) { Header(menu, [NSString stringWithFormat:@"Services (%lu)", (unsigned long)services.count]); for (LHHost *h in services) [menu addItem:[self hostItem:h]]; }
+    if (others.count) {
+        NSMenu *om = [NSMenu new];
+        for (LHHost *h in others) [om addItem:[self hostItem:h]];
+        Sub(menu, [NSString stringWithFormat:@"Other listeners, high ports (%lu)", (unsigned long)others.count], om);
+    }
+    if (self.scanner.ignored.count) {
+        NSMenu *im = [NSMenu new];
+        for (LHIgnored *i in self.scanner.ignored)
+            Header(im, [NSString stringWithFormat:@"%@   :%@   (pid %d)", i.name, [[i.ports valueForKey:@"stringValue"] componentsJoinedByString:@", :"], i.pid]);
+        [im addItem:NSMenuItem.separatorItem];
+        Header(im, @"macOS services and apps. LocoHost never touches them.");
+        Sub(menu, [NSString stringWithFormat:@"Ignored, apps and macOS (%lu)", (unsigned long)self.scanner.ignored.count], im);
+    }
+    NSArray *closed = Closed();
+    if (closed.count) {
+        NSMenu *cm = [NSMenu new];
+        Header(cm, @"Pick one to copy its restart command");
+        for (NSDictionary *c in closed)
+            Item(cm, [NSString stringWithFormat:@":%@  %@  %@   %@ ago", c[@"port"], c[@"framework"], c[@"project"],
+                      LHDuration(NSDate.date.timeIntervalSince1970 - [c[@"at"] doubleValue])], @selector(copyClosed:), self, NO).representedObject = c[@"restart"];
+        [cm addItem:NSMenuItem.separatorItem];
+        Item(cm, @"Clear", @selector(clearClosed), self, NO);
+        Sub(menu, [NSString stringWithFormat:@"Recently stopped (%lu)", (unsigned long)closed.count], cm);
+    }
+    [menu addItem:NSMenuItem.separatorItem];
+
+    NSMenu *every = [NSMenu new];
+    for (NSNumber *m in @[@0, @15, @30, @60, @120, @240])
+        Item(every, m.integerValue ? LHDuration(m.integerValue * 60) : @"Off", @selector(setReviewEvery:), self, PrefInt(kReviewMinKey, 60) == m.integerValue).tag = m.integerValue;
+    Sub(menu, @"Review Every", every);
+    NSMenu *models = [NSMenu new];
+    BOOL known = NO;
+    for (NSArray *m in LHModels()) { BOOL on = [Model() isEqualToString:m[0]]; known |= on; Item(models, m[1], @selector(setModel:), self, on).representedObject = m[0]; }
+    if (!known) Item(models, Model(), NULL, nil, YES).enabled = NO;
+    [models addItem:NSMenuItem.separatorItem];
+    Header(models, @"Haiku or Luna: Haiku first, Luna when Claude is out of usage.");
+    Header(models, @"Claude runs through the claude CLI, Luna through codex,");
+    Header(models, @"both on your own login, with no tools.");
+    Header(models, @"defaults write no.guerrilla.locohost locohost.model <name>");
+    Sub(menu, [NSString stringWithFormat:@"Model: %@", label], models);
+    NSMenu *quietAfter = [NSMenu new];
+    for (NSNumber *m in @[@10, @30, @60, @120, @360])
+        Item(quietAfter, LHDuration(m.integerValue * 60), @selector(setIdle:), self, IdleMinutes() == m.integerValue).tag = m.integerValue;
+    Sub(menu, @"Quiet After", quietAfter);
+    NSMenu *f = [NSMenu new];
+    Item(f, @"Ask Me", @selector(setForce:), self, ForceMode() == LHForceAsk).tag = LHForceAsk;
+    Item(f, @"Force Stop It", @selector(setForce:), self, ForceMode() == LHForceAlways).tag = LHForceAlways;
+    Item(f, @"Leave It Running", @selector(setForce:), self, ForceMode() == LHForceNever).tag = LHForceNever;
+    [f addItem:NSMenuItem.separatorItem];
+    Header(f, [NSString stringWithFormat:@"Servers get SIGTERM and %.0f seconds first.", kGrace]);
+    Sub(menu, @"When a Server Won't Stop", f);
+    Item(menu, @"Ask Before Closing", @selector(toggleAsk), self, PrefBool(kAskKey, YES));
+    Item(menu, @"Read Page Titles", @selector(toggleProbe), self, PrefBool(kProbeKey, YES)).toolTip = @"Sends GET / to each dev server every 5 minutes to read its page title.";
+    Item(menu, @"Edit Rules…", @selector(editRules), self, NO);
+    Item(menu, @"Launch at Login", @selector(toggleLogin), self, SMAppService.mainAppService.status == SMAppServiceStatusEnabled);
+    [menu addItem:NSMenuItem.separatorItem];
+    Header(menu, [NSString stringWithFormat:@"LocoHost %@ · watching for %@", NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"",
+                  LHDuration(-self.scanner.watchingSince.timeIntervalSinceNow)]);
+    Item(menu, @"Quit LocoHost", @selector(quit), self, NO).keyEquivalent = @"q";
+
+    self.statusItem.menu = menu;
+    [self.statusItem.button performClick:nil];
+    self.statusItem.menu = nil;
+}
+
+#pragma mark Actions
+
+- (void)closeIdle { [self closeIdleConfirm:PrefBool(kAskKey, YES)]; }
+
+- (void)closeIdleConfirm:(BOOL)confirm {
+    [self.scanner sample];   // re-check right before acting
+    NSArray<LHHost *> *c = Candidates(self.scanner.hosts, self.review);
+    if (!c.count) return;
+    if (confirm) {
+        NSAlert *a = [NSAlert new];
+        uint64_t mem = 0; for (LHHost *h in c) mem += h.memory;
+        a.messageText = [NSString stringWithFormat:@"Stop %@ (%@)?", Plural(c.count, @"idle server"), LHFormatBytes(mem)];
+        NSMutableString *list = [NSMutableString new];
+        for (LHHost *h in c)
+            [list appendFormat:@"•  :%ld %@, %@, up %@\n     %@\n", (long)h.port, h.framework, h.project, LHDuration(-h.started.timeIntervalSinceNow),
+                               self.review.verdicts[h.key].reason ?: @""];
+        [list appendFormat:@"\nEach gets SIGTERM and %.0f seconds. Recently Stopped keeps each restart command.", kGrace];
+        a.informativeText = list;
+        [a addButtonWithTitle:@"Stop Them"]; [a addButtonWithTitle:@"Cancel"];
+        a.showsSuppressionButton = YES; a.suppressionButton.title = @"Don't ask again";
+        [NSApp activateIgnoringOtherApps:YES];
+        if ([a runModal] != NSAlertFirstButtonReturn) return;
+        if (a.suppressionButton.state == NSControlStateValueOn) PrefSet(kAskKey, @NO);
+    }
+    [self escalate:StopHosts(c, kGrace)];
+    [self tick];
+}
+
+/// What to do with servers that ignored SIGTERM, per the user's setting.
+- (void)escalate:(NSArray<LHHost *> *)left {
+    if (!left.count) return;
+    LHForceMode mode = ForceMode();
+    if (mode == LHForceAsk) {
+        NSAlert *a = [NSAlert new];
+        a.alertStyle = NSAlertStyleWarning;
+        a.messageText = [NSString stringWithFormat:@"%@ did not stop", Plural(left.count, @"server")];
+        NSMutableString *names = [NSMutableString new];
+        for (LHHost *h in left) [names appendFormat:@":%ld %@ (pid %d)\n", (long)h.port, h.framework, h.pid];
+        a.informativeText = [names stringByAppendingString:@"\nForce stopping sends SIGKILL. Whatever the server held in memory is lost."];
+        [a addButtonWithTitle:@"Force Stop"]; [a addButtonWithTitle:@"Leave Running"];
+        a.buttons.firstObject.hasDestructiveAction = YES;
+        [NSApp activateIgnoringOtherApps:YES];
+        if ([a runModal] != NSAlertFirstButtonReturn) return;
+        mode = LHForceAlways;
+    }
+    if (mode == LHForceAlways) KillHosts(left);
+}
+
+- (void)stopOne:(NSMenuItem *)i {
+    LHHost *h = i.representedObject;
+    if (PrefBool(kAskKey, YES)) {
+        NSAlert *a = [NSAlert new];
+        a.messageText = [NSString stringWithFormat:@"Stop :%ld %@?", (long)h.port, h.framework];
+        a.informativeText = [NSString stringWithFormat:@"%@\n%@\n\nRestart with:\n%@", h.project, h.launcher, h.restartCommand];
+        [a addButtonWithTitle:@"Stop"]; [a addButtonWithTitle:@"Cancel"];
+        [NSApp activateIgnoringOtherApps:YES];
+        if ([a runModal] != NSAlertFirstButtonReturn) return;
+    }
+    [self escalate:StopHosts(@[h], kGrace)];
+    [self tick];
+}
+
+- (void)killOne:(NSMenuItem *)i {
+    LHHost *h = i.representedObject;
+    NSAlert *a = [NSAlert new];
+    a.alertStyle = NSAlertStyleWarning;
+    a.messageText = [NSString stringWithFormat:@"Force stop :%ld %@?", (long)h.port, h.framework];
+    a.informativeText = @"It gets SIGKILL immediately. Whatever it held in memory is lost.";
+    [a addButtonWithTitle:@"Force Stop"]; [a addButtonWithTitle:@"Cancel"];
+    a.buttons.firstObject.hasDestructiveAction = YES;
+    [NSApp activateIgnoringOtherApps:YES];
+    if ([a runModal] != NSAlertFirstButtonReturn) return;
+    RememberClosed(@[h]); KillHosts(@[h]); [self tick];
+}
+
+static void Copy(NSString *s) { [NSPasteboard.generalPasteboard clearContents]; [NSPasteboard.generalPasteboard setString:s forType:NSPasteboardTypeString]; }
+- (void)openHost:(NSMenuItem *)i    { LHHost *h = i.representedObject; [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:h.url]]; }
+- (void)copyURL:(NSMenuItem *)i     { LHHost *h = i.representedObject; Copy(h.url); }
+- (void)copyRestart:(NSMenuItem *)i { LHHost *h = i.representedObject; Copy(h.restartCommand); }
+- (void)copyClosed:(NSMenuItem *)i  { Copy(i.representedObject); }
+- (void)clearClosed                 { SetClosed(@[]); }
+- (void)reveal:(NSMenuItem *)i      { LHHost *h = i.representedObject; [NSWorkspace.sharedWorkspace selectFile:nil inFileViewerRootedAtPath:h.cwd]; }
+- (void)toggleProtect:(NSMenuItem *)i {
+    LHHost *h = i.representedObject;
+    [LHRules.shared setProtected:![LHRules.shared protectsPort:h.port] port:h.port]; [self tick];
+}
+- (void)setReviewEvery:(NSMenuItem *)i { PrefSet(kReviewMinKey, @(i.tag)); }
+- (void)setModel:(NSMenuItem *)i       { PrefSet(kModelKey, i.representedObject); }
+- (void)setIdle:(NSMenuItem *)i        { PrefSet(kIdleMinKey, @(i.tag)); [self tick]; }
+- (void)setForce:(NSMenuItem *)i       { PrefSet(kForceKey, @(i.tag)); }
+- (void)toggleAsk                      { PrefSet(kAskKey, @(!PrefBool(kAskKey, YES))); }
+- (void)toggleProbe                    { PrefSet(kProbeKey, @(!PrefBool(kProbeKey, YES))); }
+- (void)editRules { [LHRules.shared reload]; [NSWorkspace.sharedWorkspace openURL:LHRules.shared.fileURL]; }
+- (void)toggleLogin {
+    SMAppService *s = SMAppService.mainAppService; NSError *e = nil;
+    if (s.status == SMAppServiceStatusEnabled) [s unregisterAndReturnError:&e]; else [s registerAndReturnError:&e];
+    if (e) NSBeep();
+}
+- (void)quit { [NSApp terminate:nil]; }
+
+/// locohost://review | close-idle (with confirmation) | login-on | login-off | quit
+- (void)application:(NSApplication *)app openURLs:(NSArray<NSURL *> *)urls {
+    for (NSURL *u in urls) {
+        NSString *c = u.host.lowercaseString ?: @"";
+        if      ([c isEqualToString:@"review"])     [self reviewNow];
+        else if ([c isEqualToString:@"close-idle"]) [self closeIdleConfirm:YES];
+        else if ([c isEqualToString:@"login-on"] || [c isEqualToString:@"login-off"]) {
+            BOOL want = [c isEqualToString:@"login-on"];
+            if ((SMAppService.mainAppService.status == SMAppServiceStatusEnabled) != want) [self toggleLogin];
+        }
+        else if ([c isEqualToString:@"quit"])       [NSApp terminate:nil];
+    }
+}
+
+@end
+
+int main(int argc, const char **argv) {
+    @autoreleasepool {
+        if (argc > 1 && argv[1][0] != '-') return RunCLI(argc, argv);    // CLI mode
+        if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) return Usage();
+        NSApplication *app = NSApplication.sharedApplication;
+        LocoHost *delegate = [LocoHost new];
+        app.delegate = delegate;
+        [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        [app run];
+    }
+    return 0;
+}

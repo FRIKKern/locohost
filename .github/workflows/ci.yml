@@ -1,0 +1,12 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sh build.sh --no-install
+      - run: sh -n install.sh && sh -n uninstall.sh && sh -n test.sh
