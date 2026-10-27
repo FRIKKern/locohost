@@ -54,7 +54,7 @@ The review records what woke it. The menu shows it next to the last review, as "
 
 After each review the mode decides what to stop. *Mode* in the menu, or `locohost mode <name>`, sets it.
 
-Every mode keeps a dev server when any of these holds: it is protected, it was used within the quiet threshold, it started less than 30 minutes ago, there is no review from the last three hours without an error, it was used after the review, or the agent session that started it was active in the last hour.
+Every mode keeps a dev server when any of these holds: it is protected, you kept it with *Keep for 4 Hours* or `locohost keep`, it was used within the quiet threshold, it started less than 30 minutes ago, there is no review from the last three hours without an error, it was used after the review, or the agent session that started it was active in the last hour.
 
 - **Idle** stops nothing. It reviews, summarizes and shows what Close Idle would stop.
 - **Proactive** also keeps a server with a live agent process above it. It stops a server quiet for six hours that the review calls idle with at least 80% confidence.
@@ -82,7 +82,7 @@ Every server gets SIGTERM and six seconds to stop. The package manager wrapper a
 
 What happens to a server that refuses is your setting under *When a Server Won't Stop*: ask me, force stop it, or leave it running. Before every signal, LocoHost checks the process start time, so a reused pid is never signalled.
 
-*Recently Stopped* keeps the command that starts each server again. Environment variables set in the original shell are not recorded.
+*Recently Stopped* lists each stopped server with who stopped it and why. *Restart* runs its recorded command again through a login shell, and `locohost restart <port>` does the same. Output goes to `restart.log` in the support folder. Environment variables set in the original shell are not recorded.
 
 ## Limits
 

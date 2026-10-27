@@ -122,7 +122,14 @@ r=$(LOCOHOST_MIN_UPTIME_MINUTES=30 plan --mode eager);             check "eager 
 r=$(plan --mode eager);                                            check "eager stops it without evidence" True "$r"
 check "and the port is free" no "$(listening "$P")"
 r=$("$BIN" stopped --json | json "j[0]['by']");                    check "stopped records the mode" Eager "$r"
-serve "$P"; "$BIN" ready "$P" --timeout 10 >/dev/null
+"$BIN" restart "$P" >/dev/null;                                    check "restart starts it again from its recorded command" 0 "$?"
+"$BIN" ready "$P" --http --timeout 15 >/dev/null;                  check "and it answers again" 0 "$?"
+LOCOHOST_TEST_IDLE_PORT=$P "$BIN" review --mode eager >/dev/null
+"$BIN" keep "$P" 1 >/dev/null
+r=$("$BIN" auto --mode eager --port "$P" --json | json "j['plan'][0]['why'].startswith('kept by you')")
+                                                                    check "keep holds it back from eager" True "$r"
+"$BIN" keep "$P" 0 >/dev/null
+r=$(plan --mode eager --dry-run);                                  check "and releasing it hands it back to the mode" True "$r"
 unset LOCOHOST_IDLE_MINUTES LOCOHOST_MIN_UPTIME_MINUTES
 
 echo "== a failed review closes nothing"

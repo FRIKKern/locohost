@@ -41,7 +41,7 @@ Advice    Keep: it was active 2 minutes ago and has local commits ahead of its u
 | **Proactive** | Stops obvious waste: a server quiet for six hours, with no agent above it, that the review is sure nobody uses. |
 | **Eager**, the default | Stops every quiet server that can't show evidence that someone still needs it. A second model pass, the judge, looks at each one that is not clearly idle. |
 
-In Eager the burden of proof is on the server. Evidence is a new request, an agent session active in the last hour, a repo touched in the last half hour, or another local server connected to it. An open tab with no requests, a live agent process whose session has been quiet for hours, or old commits are not evidence. Stopping is cheap, because *Recently Stopped* keeps the command that starts each server again.
+In Eager the burden of proof is on the server. Evidence is a new request, an agent session active in the last hour, a repo touched in the last half hour, or another local server connected to it. An open tab with no requests, a live agent process whose session has been quiet for hours, or old commits are not evidence. Stopping is cheap, because *Recently Stopped* starts each server again with one click. *Keep for 4 Hours* on a row holds a server back from every mode.
 
 No mode stops a server that was used within the quiet window, started in the last 30 minutes, is protected, or whose agent session was active in the last hour. A mode never force stops unless your setting says so, and a notification lists everything it stopped.
 
@@ -107,7 +107,7 @@ git clone https://github.com/FRIKKern/locohost.git && cd locohost
 ./build.sh && ./test.sh
 ```
 
-Objective-C built with clang alone. No Xcode project, no Swift, no packages. `test.sh` runs 49 checks against its own Python servers and fake `claude` and `codex` CLIs, and never touches another server.
+Objective-C built with clang alone. No Xcode project, no Swift, no packages. `test.sh` runs 53 checks against its own Python servers and fake `claude` and `codex` CLIs, and never touches another server.
 
 | I want to … | Read this |
 |---|---|

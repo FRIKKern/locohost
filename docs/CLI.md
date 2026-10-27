@@ -17,7 +17,9 @@ locohost mode eager              # show or set the mode: idle, proactive or eage
 locohost idle                    # what Close Idle would stop right now
 locohost close-idle --yes        # stop them; --force SIGKILLs the ones that ignore SIGTERM; --review reviews first
 locohost close 4100 --yes        # stop one server by port or pid
-locohost stopped                 # what was stopped, with the command that starts each again
+locohost stopped                 # what was stopped, by whom and why, with the command that starts each again
+locohost restart 3317            # start the server last stopped on :3317 again
+locohost keep 3317 8             # no mode stops it for 8 hours; 0 releases it
 locohost open 3000
 ```
 

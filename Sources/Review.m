@@ -450,7 +450,7 @@ static NSString *const kJudge =
     @"commits on the branch from hours or days ago, uncommitted files nobody touched for hours, or that the developer might want it someday.\n\n"
     @"first_review is the first pass, for reference. Weigh the facts, not its verdict. "
     @"For every host return: id (copied exactly), decision (keep or stop), confidence from 0 to 1, "
-    @"evidence (the deciding fact for keep, empty for stop), and reason (one plain sentence naming the facts). "
+    @"evidence (the deciding fact for keep, empty for stop), and reason (one plain sentence of at most 25 words naming the deciding facts). "
     @"Return exactly one entry for every host id.";
 
 static NSString *JudgeSchema(void) {

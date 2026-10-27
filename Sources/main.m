@@ -87,6 +87,24 @@ static NSArray<LHHost *> *Candidates(NSArray<LHHost *> *hosts, LHReview *review)
 
 #pragma mark - Modes
 
+/// keep.json: hosts the user asked every mode to leave alone until a time, by host key.
+static NSString *KeepPath(void) { return [LHSupportDir() stringByAppendingPathComponent:@"keep.json"]; }
+static NSMutableDictionary *KeepList(void) {
+    NSData *d = [NSData dataWithContentsOfFile:KeepPath()];
+    id j = d ? [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers error:nil] : nil;
+    NSMutableDictionary *k = [j isKindOfClass:NSMutableDictionary.class] ? j : [NSMutableDictionary new];
+    for (NSString *key in k.allKeys) if ([k[key] doubleValue] < NSDate.date.timeIntervalSince1970) [k removeObjectForKey:key];
+    return k;
+}
+static NSDate *KeptUntil(LHHost *h) { id t = KeepList()[h.key]; return t ? [NSDate dateWithTimeIntervalSince1970:[t doubleValue]] : nil; }
+/// hours 0 clears it.
+static void SetKeep(LHHost *h, double hours) {
+    NSMutableDictionary *k = KeepList();
+    if (hours > 0) k[h.key] = @(NSDate.date.timeIntervalSince1970 + hours * 3600); else [k removeObjectForKey:h.key];
+    [NSFileManager.defaultManager createDirectoryAtPath:LHSupportDir() withIntermediateDirectories:YES attributes:nil error:nil];
+    [[NSJSONSerialization dataWithJSONObject:k options:NSJSONWritingPrettyPrinted error:nil] writeToFile:KeepPath() atomically:YES];
+}
+
 static double SessionMinutes(NSDictionary *intel) {
     id m = intel[@"session"][@"last_active_minutes_ago"];
     return m ? [m doubleValue] : -1;
@@ -96,6 +114,8 @@ static double SessionMinutes(NSDictionary *intel) {
 static NSString *MustKeep(LHHost *h, LHReview *r, LHMode mode, BOOL wait) {
     if (![h.kind isEqualToString:@"dev"]) return @"not a dev server";
     if (h.isProtected) return @"protected";
+    NSDate *kept = KeptUntil(h);
+    if (kept) return [NSString stringWithFormat:@"kept by you for %@ more", LHDuration(kept.timeIntervalSinceNow)];
     if (h.state != LHIdle) return h.lastActive ? [NSString stringWithFormat:@"used %@ ago", LHDuration(-h.lastActive.timeIntervalSinceNow)] : @"in use";
     if (-h.started.timeIntervalSinceNow < MinUptime()) return [NSString stringWithFormat:@"started only %@ ago", LHDuration(-h.started.timeIntervalSinceNow)];
     if (!r) return @"no review yet";
@@ -280,6 +300,25 @@ static NSArray<LHHost *> *StopHostsBy(NSArray<LHHost *> *hosts, NSTimeInterval g
 
 static NSArray<LHHost *> *StopHosts(NSArray<LHHost *> *hosts, NSTimeInterval grace) { return StopHostsBy(hosts, grace, nil, nil); }
 
+/// Starts a stopped server again with its recorded command, through a login shell so PATH matches the user's terminal.
+/// Output goes to restart.log in the support folder. Returns NO with *error set when the shell could not start.
+static BOOL Restart(NSString *command, NSString **error) {
+    NSString *log = [LHSupportDir() stringByAppendingPathComponent:@"restart.log"];
+    [NSFileManager.defaultManager createDirectoryAtPath:LHSupportDir() withIntermediateDirectories:YES attributes:nil error:nil];
+    if (![NSFileManager.defaultManager fileExistsAtPath:log]) [NSData.data writeToFile:log atomically:YES];
+    NSFileHandle *out = [NSFileHandle fileHandleForWritingAtPath:log];
+    [out seekToEndOfFile];
+    [out writeData:[[NSString stringWithFormat:@"\n%@ $ %@\n", NSDate.date, command] dataUsingEncoding:NSUTF8StringEncoding]];
+    NSTask *t = [NSTask new];
+    t.executableURL = [NSURL fileURLWithPath:@"/bin/zsh"];
+    t.arguments = @[@"-lc", command];
+    t.standardInput = NSFileHandle.fileHandleWithNullDevice; t.standardOutput = out; t.standardError = out;
+    NSError *e = nil;
+    if ([t launchAndReturnError:&e]) return YES;
+    *error = e.localizedDescription;
+    return NO;
+}
+
 /// SIGKILL. Whatever the server had in memory is lost.
 static NSArray<LHHost *> *KillHosts(NSArray<LHHost *> *hosts) {
     for (LHHost *h in hosts) if ([LHScanner alive:h]) for (NSNumber *p in Targets(h)) kill(p.intValue, SIGKILL);
@@ -390,6 +429,8 @@ static int Usage(void) {
         "  close-idle            stop every confirmed idle server\n"
         "  open <port>           open it in the browser\n"
         "  stopped               what LocoHost stopped, with the command to start each again\n"
+        "  restart <port>        start the server LocoHost last stopped on that port again\n"
+        "  keep <port> [hours]   no mode stops it for this many hours (default 4, 0 clears)\n"
         "  rules                 print the rules file path\n"
         "options:\n"
         "  --json                machine-readable output\n"
@@ -461,6 +502,19 @@ static int RunCLI(int argc, const char **argv) {
                    [c[@"why"] length] ? [NSString stringWithFormat:@": %@", c[@"why"]].UTF8String : "", [c[@"restart"] UTF8String]);
         return 0;
     }
+    if ([cmd isEqualToString:@"restart"]) {
+        if (!arg1) return Usage();
+        for (NSDictionary *c in Closed()) {
+            if ([c[@"port"] integerValue] != arg1.integerValue) continue;
+            if (LHPortListening(arg1.integerValue)) { fprintf(stderr, ":%s is already taken\n", arg1.UTF8String); return 1; }
+            NSString *e = nil;
+            if (!Restart(c[@"restart"], &e)) { fprintf(stderr, "could not restart: %s\n", e.UTF8String); return 1; }
+            printf("restarting :%s: %s\n", arg1.UTF8String, [c[@"restart"] UTF8String]);
+            return 0;
+        }
+        fprintf(stderr, "LocoHost has not stopped anything on :%s\n", arg1.UTF8String);
+        return 1;
+    }
     if ([cmd isEqualToString:@"free"]) {
         for (NSInteger p = arg1 ? arg1.integerValue : 3000; p < 65536; p++) if (PortFree(p)) { printf("%ld\n", (long)p); return 0; }
         return 1;
@@ -489,7 +543,7 @@ static int RunCLI(int argc, const char **argv) {
         [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:[NSString stringWithFormat:@"http://localhost:%@", arg1]]];
         return 0;
     }
-    if (![@[@"list", @"who", @"explain", @"waste", @"review", @"summary", @"auto", @"idle", @"close", @"close-idle"] containsObject:cmd]) return Usage();
+    if (![@[@"list", @"who", @"explain", @"waste", @"review", @"summary", @"auto", @"idle", @"close", @"close-idle", @"keep"] containsObject:cmd]) return Usage();
 
     LHScanner *s = [LHScanner new];
     s.idleSeconds = IdleMinutes() * 60;
@@ -720,6 +774,17 @@ static int RunCLI(int argc, const char **argv) {
         return CLIStop(c, force);
     }
 
+    if ([cmd isEqualToString:@"keep"]) {
+        if (!arg1) return Usage();
+        LHHost *h = FindHost(s.hosts, arg1);
+        if (!h) { fprintf(stderr, "no localhost on %s\n", arg1.UTF8String); return 1; }
+        double hours = args.count > 2 && ![args[2] hasPrefix:@"--"] ? args[2].doubleValue : 4;
+        SetKeep(h, hours);
+        if (hours > 0) printf("no mode stops :%ld %s for %s\n", (long)h.port, h.framework.UTF8String, LHDuration(hours * 3600).UTF8String);
+        else printf(":%ld %s is up to the mode again\n", (long)h.port, h.framework.UTF8String);
+        return 0;
+    }
+
     if ([cmd isEqualToString:@"close"]) {
         if (!arg1) return Usage();
         LHHost *h = FindHost(s.hosts, arg1);
@@ -935,6 +1000,9 @@ static NSMenuItem *Sub(NSMenu *m, NSString *t, NSMenu *sub) { NSMenuItem *i = It
     Item(m, @"Copy Restart Command", @selector(copyRestart:), self, NO).representedObject = h;
     [m addItem:NSMenuItem.separatorItem];
     Item(m, @"Protect (Close Idle Never Stops It)", @selector(toggleProtect:), self, [LHRules.shared protectsPort:h.port]).representedObject = h;
+    NSDate *kept = KeptUntil(h);
+    Item(m, kept ? [NSString stringWithFormat:@"Kept for %@ More (Click to Release)", LHDuration(kept.timeIntervalSinceNow)] : @"Keep for 4 Hours",
+         @selector(toggleKeep:), self, kept != nil).representedObject = h;
     Item(m, @"Stop", @selector(stopOne:), self, NO).representedObject = h;
     Item(m, @"Force Stop", @selector(killOne:), self, NO).representedObject = h;
     i.submenu = m;
@@ -1014,12 +1082,16 @@ static NSMenuItem *Sub(NSMenu *m, NSString *t, NSMenu *sub) { NSMenuItem *i = It
     NSArray *closed = Closed();
     if (closed.count) {
         NSMenu *cm = [NSMenu new];
-        Header(cm, @"Pick one to copy its restart command");
-        for (NSDictionary *c in closed)
-        {
-            NSMenuItem *ci = Item(cm, [NSString stringWithFormat:@":%@  %@  %@   %@ ago by %@", c[@"port"], c[@"framework"], c[@"project"],
-                                       LHDuration(NSDate.date.timeIntervalSince1970 - [c[@"at"] doubleValue]), c[@"by"] ?: @"you"], @selector(copyClosed:), self, NO);
-            ci.representedObject = c[@"restart"]; ci.toolTip = [c[@"why"] length] ? c[@"why"] : nil;
+        for (NSDictionary *c in closed) {
+            NSMenu *sm = [NSMenu new];
+            if ([c[@"why"] length]) for (NSString *line in Wrap(c[@"why"], 80)) Header(sm, line);
+            Header(sm, Cut(c[@"restart"], 90)).toolTip = c[@"restart"];
+            [sm addItem:NSMenuItem.separatorItem];
+            NSMenuItem *ri = Item(sm, @"Restart", @selector(restartClosed:), self, NO);
+            ri.representedObject = c; ri.enabled = !LHPortListening([c[@"port"] integerValue]);
+            Item(sm, @"Copy Restart Command", @selector(copyClosed:), self, NO).representedObject = c[@"restart"];
+            Sub(cm, [NSString stringWithFormat:@":%@  %@  %@   %@ ago by %@", c[@"port"], c[@"framework"], c[@"project"],
+                     LHDuration(NSDate.date.timeIntervalSince1970 - [c[@"at"] doubleValue]), c[@"by"] ?: @"you"], sm);
         }
         [cm addItem:NSMenuItem.separatorItem];
         Item(cm, @"Clear", @selector(clearClosed), self, NO);
@@ -1160,6 +1232,16 @@ static void Copy(NSString *s) { [NSPasteboard.generalPasteboard clearContents]; 
 - (void)copyRestart:(NSMenuItem *)i { LHHost *h = i.representedObject; Copy(h.restartCommand); }
 - (void)copyClosed:(NSMenuItem *)i  { Copy(i.representedObject); }
 - (void)clearClosed                 { SetClosed(@[]); }
+- (void)toggleKeep:(NSMenuItem *)i  { LHHost *h = i.representedObject; SetKeep(h, KeptUntil(h) ? 0 : 4); }
+- (void)restartClosed:(NSMenuItem *)i {
+    NSDictionary *c = i.representedObject; NSString *e = nil;
+    if (!Restart(c[@"restart"], &e)) {
+        NSAlert *a = [NSAlert new];
+        a.messageText = [NSString stringWithFormat:@"Could not restart :%@", c[@"port"]];
+        a.informativeText = e ?: @"";
+        [NSApp activateIgnoringOtherApps:YES]; [a runModal];
+    }
+}
 - (void)reveal:(NSMenuItem *)i      { LHHost *h = i.representedObject; [NSWorkspace.sharedWorkspace selectFile:nil inFileViewerRootedAtPath:h.cwd]; }
 - (void)toggleProtect:(NSMenuItem *)i {
     LHHost *h = i.representedObject;
