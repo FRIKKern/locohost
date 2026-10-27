@@ -1051,6 +1051,23 @@ static NSMenuItem *TextItem(NSString *text, NSInteger lines) {
     return i;
 }
 
+/// Whole sentences of text that fit in `lines` lines at this width, so a summary never stops mid-word.
+static NSString *FitSentences(NSString *text, NSFont *font, CGFloat width, NSInteger lines) {
+    NSMutableArray *parts = [NSMutableArray new];
+    [text enumerateSubstringsInRange:NSMakeRange(0, text.length) options:NSStringEnumerationBySentences usingBlock:^(NSString *sub, NSRange r, NSRange er, BOOL *stop) {
+        [parts addObject:[text substringWithRange:er]];
+    }];
+    CGFloat limit = lines * (font.ascender - font.descender + font.leading) + 1;
+    NSMutableString *out = [NSMutableString new];
+    for (NSString *p in parts) {
+        NSString *next = [[out stringByAppendingString:p] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        CGFloat h = [next boundingRectWithSize:NSMakeSize(width, 4000) options:NSStringDrawingUsesLineFragmentOrigin attributes:@{NSFontAttributeName: font}].size.height;
+        if (h > limit && out.length) break;
+        [out appendString:p];
+    }
+    return [out stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
 static NSString *Sentence(NSString *s) {
     if (!s.length) return @"";
     s = [[s substringToIndex:1].uppercaseString stringByAppendingString:[s substringFromIndex:1]];
@@ -1117,6 +1134,7 @@ static NSString *GitState(NSDictionary *g) {
     void (^fact)(NSString *, NSString *) = ^(NSString *label, NSString *value) {
         if (!value.length) return;
         NSTextField *l = [NSTextField labelWithString:label]; l.font = [NSFont systemFontOfSize:11.5]; l.textColor = NSColor.tertiaryLabelColor;
+        l.alignment = NSTextAlignmentRight; [l.widthAnchor constraintEqualToConstant:50].active = YES;   // the same label column on every card
         NSTextField *x = [NSTextField labelWithString:value]; x.font = [NSFont systemFontOfSize:12]; x.textColor = NSColor.labelColor;
         x.lineBreakMode = NSLineBreakByTruncatingTail; [x.widthAnchor constraintLessThanOrEqualToConstant:inner - 70].active = YES;
         x.toolTip = value;
@@ -1124,22 +1142,32 @@ static NSString *GitState(NSDictionary *g) {
     };
     NSDictionary *where = LHWhere(h, NO);
     fact(@"Where", where[@"label"]);
-    fact(@"Up", LHDuration(-h.started.timeIntervalSinceNow));
-    fact(@"Started", h.launcher.length ? h.launcher : @"unknown");
-    fact(@"Uses", [NSString stringWithFormat:@"%@ · %@ CPU now%@", LHFormatBytes(h.memory), Pct(h.cpuPercent),
-                   h.clients.count ? [@" · " stringByAppendingString:[h.clients componentsJoinedByString:@", "]] : @""]);
-    fact(@"Project", [NSString stringWithFormat:@"%@%@", h.project, h.branch ? [@" · " stringByAppendingString:h.branch] : @""]);
-    if ([h.kind isEqualToString:@"dev"]) fact(@"Agent", intel ? SessionWords(intel[@"session"]) : @"looking…");
-    fact(@"Git", GitState(intel[@"git"]));
-    if (h.title.length) fact(@"Page", h.title);
+    // "pnpm dev --port 3300 · cmux · parent exited" reads "pnpm dev · cmux · parent exited": the full command is under More.
+    NSMutableArray *by = [[h.launcher componentsSeparatedByString:@" · "] mutableCopy];
+    if (by.count) { NSArray *w = [by[0] componentsSeparatedByString:@" "]; by[0] = [[w subarrayWithRange:NSMakeRange(0, MIN(2, w.count))] componentsJoinedByString:@" "]; }
+    fact(@"Up", [NSString stringWithFormat:@"%@, started by %@", LHDuration(-h.started.timeIntervalSinceNow), h.launcher.length ? [by componentsJoinedByString:@" · "] : @"unknown"]);
+    fact(@"Uses", [NSString stringWithFormat:@"%@ · %@ CPU%@", LHFormatBytes(h.memory), Pct(h.cpuPercent),
+                   h.clients.count ? [@" · open in " stringByAppendingString:[h.clients componentsJoinedByString:@", "]] : @""]);
+    NSString *git = GitState(intel[@"git"]);
+    NSString *branch = [h.branch hasPrefix:@"detached"] ? nil : h.branch;   // a detached commit's hash says nothing here
+    if (branch || git.length) fact(@"Git", [[@[branch ?: @"", git ?: @""] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]] componentsJoinedByString:@" · "]);
+    if ([h.kind isEqualToString:@"dev"]) {
+        NSDictionary *se = intel[@"session"];
+        NSString *t = se[@"title"] ?: se[@"first_prompt"];
+        fact(@"Agent", !intel ? @"looking…" : se ? [NSString stringWithFormat:@"%@%@, %@ ago", se[@"agent"], t ? [NSString stringWithFormat:@", “%@”", t] : @"",
+                                                     [LHDuration([se[@"last_active_minutes_ago"] doubleValue] * 60) componentsSeparatedByString:@" "].firstObject] : @"none found");
+    }
     if (rows.count) {
         NSGridView *g = [NSGridView gridViewWithViews:rows];
         g.rowSpacing = 4; g.columnSpacing = 10; [g columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
+        [g columnAtIndex:0].width = 50; [g columnAtIndex:1].xPlacement = NSGridCellPlacementLeading;   // the same columns on every card
         [s addArrangedSubview:g];
     }
-    if (v.reason.length)
+    NSString *said = [st[2] lowercaseString], *reason = v.reason.lowercaseString;
+    BOOL repeats = reason.length > 12 && [said containsString:[reason substringToIndex:MIN(reason.length, 40)]];
+    if (v.reason.length && !repeats)
         [s addArrangedSubview:Para([NSString stringWithFormat:@"%@ says %@: %@", LHModelLabel(self.review.model), [v.verdict stringByReplacingOccurrencesOfString:@"_" withString:@" "], v.reason],
-                                   [NSFont systemFontOfSize:11.5], NSColor.secondaryLabelColor, inner, 3)];
+                                   [NSFont systemFontOfSize:11.5], NSColor.secondaryLabelColor, inner, 2)];
     NSSize fit = s.fittingSize;
     s.frame = NSMakeRect(0, 0, MAX(fit.width, inner + 32), fit.height);
     NSMenuItem *i = [NSMenuItem new]; i.view = s;
@@ -1150,9 +1178,10 @@ static NSString *GitState(NSDictionary *g) {
     NSString *name = ShortName(h);
     if (self.prefix.length && [h.kind isEqualToString:@"dev"] && [name hasPrefix:self.prefix] && name.length > self.prefix.length) name = [name substringFromIndex:self.prefix.length];
     NSMenuItem *i = [[NSMenuItem alloc] initWithTitle:h.framework action:nil keyEquivalent:@""];
-    NSString *state = h.clients.count ? [@"in " stringByAppendingString:h.clients.firstObject] : StateWords(h);
-    NSString *sub = [NSString stringWithFormat:@"%@ · %@ · up %@ · %@", h.framework, LHFormatBytes(h.memory),
-                     [LHDuration(-h.started.timeIntervalSinceNow) componentsSeparatedByString:@" "].firstObject, Cut(state, 34)];
+    // At most three facts: what it is, its memory, and who has it open, else how long it has been up.
+    NSString *third = h.clients.count ? [@"in " stringByAppendingString:Cut(h.clients.firstObject, 28)]
+                                      : [@"up " stringByAppendingString:[LHDuration(-h.started.timeIntervalSinceNow) componentsSeparatedByString:@" "].firstObject];
+    NSString *sub = [NSString stringWithFormat:@"%@ · %@ · %@", h.framework, LHFormatBytes(h.memory), third];
     if (ModernMenu()) {
         if (@available(macOS 14.4, *)) {
             i.title = [NSString stringWithFormat:@"%@   :%ld", Cut(name, 40), (long)h.port];
@@ -1224,7 +1253,7 @@ static NSString *GitState(NSDictionary *g) {
     [menu addItem:NSMenuItem.separatorItem];
 
     // What is going on, in up to four readable lines. The review's details sit under Review Now.
-    if (r.summary.length) [menu addItem:TextItem(r.summary, 4)];
+    if (r.summary.length) [menu addItem:TextItem(FitSentences(r.summary, [NSFont systemFontOfSize:12.5], 302, 3), 3)];
     else if (r.error) [menu addItem:TextItem([@"The last review failed: " stringByAppendingString:r.error], 3)];
     [menu addItem:NSMenuItem.separatorItem];
     if (idle.count) {
@@ -1261,11 +1290,6 @@ static NSString *GitState(NSDictionary *g) {
         [cm addItem:NSMenuItem.separatorItem];
         Item(cm, @"Clear", @selector(clearClosed), self, NO);
         Sub(menu, @"Recently Stopped", cm);
-    }
-    if (others.count) {
-        NSMenu *om = [NSMenu new];
-        for (LHHost *h in others) [om addItem:[self hostItem:h]];
-        Sub(menu, @"Other Listeners", om);
     }
 
     NSMenu *set = [NSMenu new];
@@ -1311,6 +1335,11 @@ static NSString *GitState(NSDictionary *g) {
     Item(set, @"Read Page Titles", @selector(toggleProbe), self, PrefBool(kProbeKey, YES)).toolTip = @"Sends GET / to each dev server every 5 minutes to read its page title.";
     Item(set, @"Launch at Login", @selector(toggleLogin), self, SMAppService.mainAppService.status == SMAppServiceStatusEnabled);
     Item(set, @"Edit Rules…", @selector(editRules), self, NO);
+    if (others.count) {
+        NSMenu *om = [NSMenu new];
+        for (LHHost *h in others) [om addItem:[self hostItem:h]];
+        Sub(set, [NSString stringWithFormat:@"Other Listeners (%lu)", (unsigned long)others.count], om);
+    }
     if (self.scanner.ignored.count) {
         NSMenu *im = [NSMenu new];
         for (LHIgnored *i in self.scanner.ignored)

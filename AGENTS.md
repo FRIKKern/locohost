@@ -10,6 +10,8 @@ locohost list                    # non-destructive: every localhost and its stat
 
 **Layout**: `Sources/Ports.m` samples processes and sockets through libproc, builds one `LHHost` per listening process, detects framework, git, launcher and clients, keeps the activity history in `activity.json` and runs the HTTP title probe. `Sources/Rules.m` holds the protect and ignore lists in `rules.json`. `Sources/Intel.m` investigates each dev server: the allowlisted project files, git state, and the agent session that was open when it started, cached for five minutes. `Sources/Where.m` finds the cmux tab, tmux pane, Terminal or iTerm2 tab, or app each server runs in, and brings it forward. `Sources/Review.m` builds the redacted facts, runs the claude CLI, or the codex CLI for Luna, and saves `review.json`. `Sources/main.m` holds the manual idle decision (`Candidates`), the modes (`MustKeep`, `Plan`, `JudgeSubjects`, `RunReview`, `AutoStop`), stopping, the CLI (`RunCLI`), the review triggers (`watchEvents`) and the menu bar UI. `tools/mkicon.m` renders the icon. `tools/fakeclaude.py` and `tools/fakecodex.py` stand in for the two CLIs in tests, both answering through `tools/fakeanswer.py`.
 
+**The menu** follows [docs/DESIGN.md](docs/DESIGN.md), the standard shared with WorkForest. Check every menu change in rendered images before calling it done.
+
 **Invariants that must hold after any change**
 
 1. `Candidates` is the only way to the manual Close Idle, and it requires all of these: kind `dev`, not protected, state `LHIdle` by local signals, an `idle` verdict with confidence of at least `kMinConfidence` from a review without an error, and no activity after that review. The menu, `locohost idle` and `locohost close-idle` all use it.

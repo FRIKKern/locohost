@@ -16,6 +16,12 @@ All notable changes to LocoHost. Format follows [Keep a Changelog](https://keepa
 - Each review writes a summary of the whole Mac, shown at the top of the menu and by `locohost summary`.
 - `locohost mode`, `locohost summary` and `locohost auto` with `--dry-run`, `--mode` and `--port`. Stops by a mode are recorded with the mode and the reason, and announced in a notification.
 - Where each server runs: its cmux tab, tmux pane, Terminal or iTerm2 tab, or the app it came from. *Go to* in a row's menu and `locohost where <port> --go` bring it forward.
+- The menu follows docs/DESIGN.md, the standard shared with WorkForest:
+  - rows show at most three facts
+  - cards show five, with labels in one column
+  - the summary stops at a whole sentence
+  - the model's note shows only when it adds something
+  - Other Listeners moved into Settings
 - A calmer menu: memory in large type, the summary as readable text, native rows with a short second line, and a hover card that says in plain words why a server is still running.
 - *Keep for 4 Hours* on a row and `locohost keep <port> [hours]` hold a server back from every mode.
 - *Restart* in Recently Stopped and `locohost restart <port>` start a stopped server again from its recorded command.
